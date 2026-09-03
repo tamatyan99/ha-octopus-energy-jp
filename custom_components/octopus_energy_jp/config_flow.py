@@ -121,24 +121,6 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-def _optional_number(value: Any) -> float | None:
-    """Accept empty input as None, otherwise coerce to float."""
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise vol.Invalid("expected a number") from None
-
-
-def _optional_non_negative(value: Any) -> float | None:
-    """Accept empty input as None, otherwise require a non-negative float."""
-    num = _optional_number(value)
-    if num is not None and num < 0:
-        raise vol.Invalid("must be non-negative")
-    return num
-
-
 def _options_schema(current: dict[str, Any]) -> vol.Schema:
     """Build the options schema, pre-filling current values."""
 
@@ -153,15 +135,27 @@ def _options_schema(current: dict[str, Any]) -> vol.Schema:
         {
             vol.Optional(
                 CONF_BASIC_CHARGE_PER_DAY, default=_suggest(CONF_BASIC_CHARGE_PER_DAY)
-            ): _optional_non_negative,
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
             vol.Optional(
                 CONF_FUEL_ADJUSTMENT_PER_KWH,
                 default=_suggest(CONF_FUEL_ADJUSTMENT_PER_KWH),
-            ): _optional_number,
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    step=0.01, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
             vol.Optional(
                 CONF_RENEWABLE_LEVY_PER_KWH,
                 default=_suggest(CONF_RENEWABLE_LEVY_PER_KWH),
-            ): _optional_non_negative,
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
         }
     )
 

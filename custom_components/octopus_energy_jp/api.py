@@ -68,6 +68,8 @@ query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDa
       electricitySupplyPoints {
         halfHourlyReadings(fromDatetime: $fromDatetime, toDatetime: $toDatetime) {
           startAt
+          endAt
+          version
           value
         }
       }
@@ -254,6 +256,7 @@ class OctopusEnergyJpApiClient:
     ) -> list[dict[str, Any]]:
         """Return half-hourly readings for the period.
 
+        Each dict contains ``startAt``/``endAt``/``version``/``value``.
         The caller is expected to split long periods into chunks
         (see utils.chunk_date_range). ``limit`` is kept for backward
         compatibility but currently unused: the Kraken endpoint does

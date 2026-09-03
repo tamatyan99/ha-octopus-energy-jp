@@ -216,10 +216,12 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise OctopusApiError("All readings chunks failed")
 
         # 30分値をローカル日付・ローカル時間枠に集計
+        # Kraken は同一 startAt の改訂版(version違い)を返すことがあるため
+        # 先に startAt で重複排除してから集計する(二重計上防止)
         daily_kwh: dict[str, float] = {}
         hourly_kwh: dict[datetime, float] = {}
         series_by_day: dict[str, list[dict[str, Any]]] = {}
-        for r in readings:
+        for r in utils.deduplicate_readings(readings):
             if not isinstance(r, dict):
                 continue
             raw_start = r.get("startAt")

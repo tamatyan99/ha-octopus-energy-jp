@@ -114,3 +114,41 @@ def prune_days(days: dict[str, float], keep: int) -> dict[str, float]:
     if len(days) <= keep:
         return dict(days)
     return dict(sorted(days.items())[-keep:])
+
+
+def deduplicate_readings(readings: list[dict]) -> list[dict]:
+    """Deduplicate half-hourly readings by ``startAt``.
+
+    The Kraken API may return multiple revisions of the same slot
+    (same ``startAt``, different ``version``). Each element is expected
+    to look like ``{"startAt": str, "value": Any, "version": Any}``.
+    When duplicates share a ``startAt``, the entry with the larger
+    ``version`` wins when versions are comparable; otherwise the later
+    occurrence wins. ``None``/non-dict elements (and dicts without a
+    ``startAt``) are skipped. The result is sorted by ``startAt``
+    ascending.
+    """
+    best: dict[Any, dict] = {}
+    for entry in readings or []:
+        if not isinstance(entry, dict):
+            continue
+        start = entry.get("startAt")
+        if start is None:
+            continue
+        prev = best.get(start)
+        if prev is None:
+            best[start] = entry
+            continue
+        prev_version = prev.get("version")
+        cur_version = entry.get("version")
+        if prev_version is None or cur_version is None:
+            # version 無しは後勝ち
+            best[start] = entry
+            continue
+        try:
+            if cur_version >= prev_version:
+                best[start] = entry
+        except TypeError:
+            # 比較不能な型同士は後勝ち
+            best[start] = entry
+    return [best[key] for key in sorted(best.keys(), key=str)]

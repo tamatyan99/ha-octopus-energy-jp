@@ -135,3 +135,42 @@ def test_slugify_account_none() -> None:
 
 def test_tiered_cost_empty_rates() -> None:
     assert utils.tiered_cost(100, []) == 0.0
+
+
+def test_deduplicate_readings_prefers_larger_version() -> None:
+    readings = [
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1.0, "version": 1},
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 2.0, "version": 2},
+        {"startAt": "2026-01-01T00:30:00+09:00", "value": 3.0, "version": 1},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 2
+    assert result[0]["value"] == 2.0
+    assert result[0]["version"] == 2
+
+
+def test_deduplicate_readings_no_version_later_wins() -> None:
+    readings = [
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1.0},
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 5.0},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 5.0
+
+
+def test_deduplicate_readings_skips_none_and_non_dict() -> None:
+    readings = [
+        None,
+        "not-a-dict",
+        {"value": 9.0},
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1.0, "version": 1},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert result == [
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1.0, "version": 1}
+    ]
+
+
+def test_deduplicate_readings_empty() -> None:
+    assert utils.deduplicate_readings([]) == []

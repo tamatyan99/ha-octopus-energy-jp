@@ -29,6 +29,19 @@
       "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Billing options",
+        "description": "Optional surcharges added on top of the energy charge for the billing period sensor. Leave empty to keep energy-only billing.",
+        "data": {
+          "basic_charge_per_day": "Basic charge (JPY/day)",
+          "fuel_adjustment_per_kwh": "Fuel cost adjustment (JPY/kWh)",
+          "renewable_levy_per_kwh": "Renewable energy levy (JPY/kWh)"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "usage": { "name": "Octopus Energy Usage" },
@@ -41,7 +54,9 @@
       "cost_yesterday": { "name": "Yesterday cost" },
       "cost_today": { "name": "Today cost" },
       "cost_month": { "name": "Month cost" },
-      "prev_month_cost": { "name": "Previous month cost" }
+      "prev_month_cost": { "name": "Previous month cost" },
+      "billing_kwh": { "name": "Billing period usage" },
+      "billing_cost": { "name": "Billing period cost" }
     }
   }
 }

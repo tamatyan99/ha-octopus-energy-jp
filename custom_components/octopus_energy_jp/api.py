@@ -10,7 +10,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL
-from .utils import RateTier, normalize_rates
+from .utils import RateTier, normalize_rates, select_latest_bill
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,6 +86,27 @@ query tariff($gridOperatorCode: String!, $productCode: String) {
     tiers {
       contractCapacityPattern
       consumptionRates { pricePerUnitIncTax stepStart stepEnd band }
+    }
+  }
+}
+"""
+
+BILLS_QUERY = """
+query bills($accountNumber: String!) {
+  account(accountNumber: $accountNumber) {
+    bills(first: 6, orderBy: ISSUED_DATE_DESC) {
+      edges { node { billType fromDate toDate issuedDate } }
+    }
+  }
+}
+"""
+
+# orderBy enum 名がスキーマと異なる場合のフォールバック (ソートはローカルで実施)
+BILLS_QUERY_SIMPLE = """
+query bills($accountNumber: String!) {
+  account(accountNumber: $accountNumber) {
+    bills(first: 6) {
+      edges { node { billType fromDate toDate issuedDate } }
     }
   }
 }
@@ -276,6 +297,38 @@ class OctopusEnergyJpApiClient:
         if not isinstance(readings, list):
             raise OctopusApiError("Unexpected readings response structure")
         return readings
+
+    async def async_get_latest_bill(
+        self, account_number: str
+    ) -> dict[str, Any] | None:
+        """Return the most recent bill period, or None when unavailable.
+
+        Prefers STATEMENT/INVOICE bills and picks the latest one by
+        issuedDate (the query asks for ISSUED_DATE_DESC, but the sort is
+        redone locally so an unknown orderBy enum never breaks parsing).
+        Returns None for empty/malformed responses without raising;
+        transport/auth errors still raise OctopusApiError/OctopusAuthError.
+        """
+        try:
+            data = await self._async_query(
+                BILLS_QUERY, {"accountNumber": account_number}
+            )
+        except OctopusAuthError:
+            raise
+        except OctopusApiError as err:
+            # orderBy enum 名の不一致等で失敗した場合は引数なしで再試行
+            # (認証エラーは再認証フローに渡すため再試行しない)
+            _LOGGER.debug("Bills query with orderBy failed, retrying simple: %s", err)
+            data = await self._async_query(
+                BILLS_QUERY_SIMPLE, {"accountNumber": account_number}
+            )
+        try:
+            account = data.get("account")
+            if not isinstance(account, dict):
+                return None
+            return select_latest_bill(account.get("bills"))
+        except (TypeError, AttributeError):
+            return None
 
     async def async_get_tariff_rates(
         self, grid_operator_code: str, product_code: str, capacity_unit: str

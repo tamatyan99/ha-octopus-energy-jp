@@ -11,7 +11,9 @@
       "cost_yesterday": { "default": "mdi:currency-jpy" },
       "cost_today": { "default": "mdi:currency-jpy" },
       "cost_month": { "default": "mdi:currency-jpy" },
-      "prev_month_cost": { "default": "mdi:currency-jpy" }
+      "prev_month_cost": { "default": "mdi:currency-jpy" },
+      "billing_kwh": { "default": "mdi:counter" },
+      "billing_cost": { "default": "mdi:currency-jpy" }
     }
   }
 }

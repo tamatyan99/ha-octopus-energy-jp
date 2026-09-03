@@ -17,6 +17,9 @@ from . import utils
 from .api import OctopusApiError, OctopusAuthError, OctopusEnergyJpApiClient
 from .const import (
     CONF_ACCOUNT_NUMBER,
+    CONF_BASIC_CHARGE_PER_DAY,
+    CONF_FUEL_ADJUSTMENT_PER_KWH,
+    CONF_RENEWABLE_LEVY_PER_KWH,
     DOMAIN,
     MAX_DAILY_DAYS,
     STATIC_CACHE_TTL,
@@ -79,6 +82,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.api = api
         self.account_number: str = entry.data[CONF_ACCOUNT_NUMBER]
+        # DataUpdateCoordinator.config_entry は HA 2024.11+ のため自前でも保持
+        self._entry = entry
         self._static_fetched_at: datetime | None = None
         self._contract: dict[str, Any] | None = None
         self._rates: list[utils.RateTier] | None = None
@@ -176,8 +181,7 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         rates = self._rates
         contract = self._contract
 
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # 日別料金グラフと統計バックフィルのため当月を含む過去3か月分を取得
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)        # 日別料金グラフと統計バックフィルのため当月を含む過去3か月分を取得
         back_year = month_start.year
         back_month = month_start.month - 2
         if back_month <= 0:
@@ -333,6 +337,41 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for d, kwh in sorted(daily_kwh.items())
         ]
 
+        # 請求期間の特定: 直近請求書の fromDate/toDate をそのまま使う。
+        # 取得失敗・空・構造異常時は請求期間機能だけ無効化し更新は継続する。
+        latest_bill: dict[str, Any] | None = None
+        try:
+            latest_bill = await self.api.async_get_latest_bill(self.account_number)
+        except OctopusAuthError:
+            raise
+        except Exception as err:  # noqa: BLE001 - bills failure must not fail update
+            _LOGGER.warning("Latest bill fetch failed, skipping billing period: %s", err)
+            latest_bill = None
+
+        billing_period: dict[str, Any] | None = None
+        billing: dict[str, Any] | None = None
+        if latest_bill is not None:
+            from_day = utils.parse_day(latest_bill.get("from_date"))
+            to_day = utils.parse_day(latest_bill.get("to_date"))
+            if from_day is not None and to_day is not None and from_day <= to_day:
+                billing_period = {
+                    "from": from_day,
+                    "to": to_day,
+                    "bill_type": latest_bill.get("bill_type"),
+                    "source": "bill",
+                }
+                options = self._entry.options
+                billing = utils.compute_billing(
+                    daily_kwh,
+                    rates,
+                    from_day,
+                    to_day,
+                    "bill",
+                    utils.coerce_option_float(options.get(CONF_BASIC_CHARGE_PER_DAY)),
+                    utils.coerce_option_float(options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)),
+                    utils.coerce_option_float(options.get(CONF_RENEWABLE_LEVY_PER_KWH)),
+                )
+
         return {
             "yesterday_kwh": yesterday_kwh,
             "today_kwh": today_kwh,
@@ -355,5 +394,7 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for start, kwh in sorted(hourly_kwh.items())
             ],
             "plan_name": contract.get("plan_name"),
+            "billing_period": billing_period,
+            "billing": billing,
             "last_update": now.isoformat(),
         }

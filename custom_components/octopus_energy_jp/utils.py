@@ -152,3 +152,144 @@ def deduplicate_readings(readings: list[dict]) -> list[dict]:
             # 比較不能な型同士は後勝ち
             best[start] = entry
     return [best[key] for key in sorted(best.keys(), key=str)]
+
+
+# 請求書タイプの優先対象 (STATEMENT/INVOICE を優先、それ以外も利用可)
+_PREFERRED_BILL_TYPES = frozenset({"STATEMENT", "INVOICE"})
+
+
+def select_latest_bill(bills: Any) -> dict[str, Any] | None:
+    """Pick the most recent bill period from a GraphQL ``bills`` payload.
+
+    Accepts either ``{"edges": [{"node": {...}}, ...]}`` or a bare list of
+    nodes (defensive: the orderBy enum name may differ per schema, so the
+    issuedDate sort is redone locally). STATEMENT/INVOICE bills are
+    preferred; the latest one by issuedDate wins. Returns None for
+    empty/malformed payloads without raising (except on non-dict access
+    errors, which the caller guards).
+    """
+    if isinstance(bills, dict):
+        edges = bills.get("edges")
+    elif isinstance(bills, list):
+        edges = bills
+    else:
+        return None
+    if not isinstance(edges, list) or not edges:
+        return None
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for edge in edges:
+        if isinstance(edge, dict) and isinstance(edge.get("node"), dict):
+            node = edge["node"]
+        elif isinstance(edge, dict):
+            node = edge
+        else:
+            continue
+        from_date = node.get("fromDate")
+        to_date = node.get("toDate")
+        if not isinstance(from_date, str) or not from_date:
+            continue
+        if not isinstance(to_date, str) or not to_date:
+            continue
+        bill_type = node.get("billType")
+        issued = node.get("issuedDate")
+        preferred = 0 if bill_type in _PREFERRED_BILL_TYPES else 1
+        candidates.append(
+            (
+                preferred,
+                issued if isinstance(issued, str) else "",
+                {
+                    "bill_type": bill_type if isinstance(bill_type, str) else None,
+                    "from_date": from_date,
+                    "to_date": to_date,
+                    "issued_date": issued if isinstance(issued, str) else None,
+                },
+            )
+        )
+    if not candidates:
+        return None
+    # issuedDate 降順 → STATEMENT/INVOICE 優先 (stable sort の順序で適用)
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    candidates.sort(key=lambda c: c[0])
+    return candidates[0][2]
+
+
+def parse_day(value: Any) -> str | None:
+    """Extract a ``YYYY-MM-DD`` day string from a bill date value.
+
+    Accepts full ISO datetimes as well as plain dates; returns None for
+    unparseable values. Only the date part is significant for aggregation.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    day = value[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return None
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return day
+
+
+def coerce_option_float(value: Any) -> float:
+    """Coerce an options value to float; garbage (incl. NaN/Inf) → 0.0."""
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(num):
+        return 0.0
+    return num
+
+
+def compute_billing(
+    daily_kwh: dict[str, float],
+    rates: list[RateTier],
+    from_day: str,
+    to_day: str,
+    source: str,
+    basic_per_day: float,
+    fuel_per_kwh: float,
+    levy_per_kwh: float,
+) -> dict[str, Any] | None:
+    """Aggregate billing-period usage and cost.
+
+    Sums daily_kwh inside [from_day, to_day] (inclusive, both ends).
+    Returns None when no daily data falls inside the period.
+    Zero-valued surcharges are excluded from the breakdown (and from
+    the total), so default options yield energy-only billing.
+    """
+    in_period = [day for day in daily_kwh if from_day <= day <= to_day]
+    if not in_period:
+        return None
+    total_kwh = sum(daily_kwh[day] for day in in_period)
+    try:
+        span = (
+            datetime.strptime(to_day, "%Y-%m-%d").date()
+            - datetime.strptime(from_day, "%Y-%m-%d").date()
+        ).days + 1
+        period_days = span if span > 0 else len(in_period)
+    except (ValueError, TypeError):
+        period_days = len(in_period)
+    energy_cost = tiered_cost(total_kwh, rates)
+    basic_charge = basic_per_day * period_days if basic_per_day else 0.0
+    fuel_adjustment = fuel_per_kwh * total_kwh if fuel_per_kwh else 0.0
+    renewable_levy = levy_per_kwh * total_kwh if levy_per_kwh else 0.0
+    billing: dict[str, Any] = {
+        "kwh": round(total_kwh, 1),
+        "days": period_days,
+        "energy_cost": round(energy_cost),
+        "from": from_day,
+        "to": to_day,
+        "source": source,
+    }
+    if basic_charge:
+        billing["basic_charge"] = round(basic_charge)
+    if fuel_adjustment:
+        billing["fuel_adjustment"] = round(fuel_adjustment)
+    if renewable_levy:
+        billing["renewable_levy"] = round(renewable_levy)
+    billing["total"] = round(
+        energy_cost + basic_charge + fuel_adjustment + renewable_levy
+    )
+    return billing

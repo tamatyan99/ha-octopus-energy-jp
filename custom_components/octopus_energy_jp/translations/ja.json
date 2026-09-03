@@ -29,6 +29,19 @@
       "reauth_successful": "再認証に成功しました"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "請求オプション",
+        "description": "請求期間センサーの電力量料金に加算する任意の追加料金です。空欄のままにすると電力量料金のみになります。",
+        "data": {
+          "basic_charge_per_day": "基本料金(円/日)",
+          "fuel_adjustment_per_kwh": "燃料費調整額(円/kWh)",
+          "renewable_levy_per_kwh": "再エネ賦課金(円/kWh)"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "usage": { "name": "使用量(前日)" },
@@ -41,7 +54,9 @@
       "cost_yesterday": { "name": "昨日の料金" },
       "cost_today": { "name": "当日の料金" },
       "cost_month": { "name": "当月の料金" },
-      "prev_month_cost": { "name": "前月の料金" }
+      "prev_month_cost": { "name": "前月の料金" },
+      "billing_kwh": { "name": "請求期間使用量" },
+      "billing_cost": { "name": "請求期間料金" }
     }
   }
 }

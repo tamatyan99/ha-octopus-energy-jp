@@ -52,6 +52,7 @@ async def async_get_config_entry_diagnostics(
         if key in ("daily", "yesterday_series", "today_series", "hourly"):
             summarized[key] = _summarize_list(value)
         else:
+            # billing / billing_period は小さなサマリーdictのためそのまま含める
             summarized[key] = value
 
     entry_data = {

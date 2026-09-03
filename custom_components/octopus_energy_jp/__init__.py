@@ -45,6 +45,13 @@ def _hourly_signature(hourly: list) -> tuple:
             return (0, "")
 
 
+async def _async_reload_on_update(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Reload the entry when options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
     api = OctopusEnergyJpApiClient(
@@ -55,6 +62,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = OctopusEnergyJpCoordinator(hass, entry, api)
     await coordinator.async_load()
     await coordinator.async_config_entry_first_refresh()
+
+    # options 変更時はエントリをリロード（coordinator が最新 options を参照する）
+    entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
 
     try:
         # 新シグネチャ (hass, entry_id, account_number) に対応

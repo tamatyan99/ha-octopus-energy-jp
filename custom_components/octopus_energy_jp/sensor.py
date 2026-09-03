@@ -129,6 +129,24 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         suggested_display_precision=0,
         value_fn=lambda d: d["prev_month_cost"],
     ),
+    OctopusSensorDescription(
+        key="billing_kwh",
+        translation_key="billing_kwh",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement="kWh",
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=1,
+        value_fn=lambda d: (d.get("billing") or {}).get("kwh"),
+    ),
+    OctopusSensorDescription(
+        key="billing_cost",
+        translation_key="billing_cost",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="JPY",
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=0,
+        value_fn=lambda d: (d.get("billing") or {}).get("total"),
+    ),
 )
 
 

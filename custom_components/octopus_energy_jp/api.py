@@ -62,11 +62,11 @@ query contractInfo($accountNumber: String!) {
 """
 
 READINGS_QUERY = """
-query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDatetime: DateTime, $first: Int) {
+query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDatetime: DateTime) {
   account(accountNumber: $accountNumber) {
     properties {
       electricitySupplyPoints {
-        halfHourlyReadings(first: $first, fromDatetime: $fromDatetime, toDatetime: $toDatetime) {
+        halfHourlyReadings(fromDatetime: $fromDatetime, toDatetime: $toDatetime) {
           startAt
           value
         }
@@ -250,20 +250,20 @@ class OctopusEnergyJpApiClient:
         account_number: str,
         from_dt: datetime,
         to_dt: datetime,
-        limit: int | None = 5000,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return half-hourly readings for the period.
 
         The caller is expected to split long periods into chunks
-        (see utils.chunk_date_range); ``limit`` caps readings per call.
+        (see utils.chunk_date_range). ``limit`` is kept for backward
+        compatibility but currently unused: the Kraken endpoint does
+        not accept a ``first`` argument on this field.
         """
         variables: dict[str, Any] = {
             "accountNumber": account_number,
             "fromDatetime": from_dt.isoformat(),
             "toDatetime": to_dt.isoformat(),
         }
-        if limit is not None:
-            variables["first"] = limit
         data = await self._async_query(READINGS_QUERY, variables)
         account = data.get("account")
         if not isinstance(account, dict):

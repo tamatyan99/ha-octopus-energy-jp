@@ -1,0 +1,17 @@
+{
+  "entity": {
+    "sensor": {
+      "usage": { "default": "mdi:flash" },
+      "yesterday_kwh": { "default": "mdi:counter" },
+      "today_kwh": { "default": "mdi:counter" },
+      "month_kwh": { "default": "mdi:counter" },
+      "diff_kwh": { "default": "mdi:compare-horizontal" },
+      "prev_month_kwh": { "default": "mdi:counter" },
+      "month_diff_kwh": { "default": "mdi:compare-horizontal" },
+      "cost_yesterday": { "default": "mdi:currency-jpy" },
+      "cost_today": { "default": "mdi:currency-jpy" },
+      "cost_month": { "default": "mdi:currency-jpy" },
+      "prev_month_cost": { "default": "mdi:currency-jpy" }
+    }
+  }
+}

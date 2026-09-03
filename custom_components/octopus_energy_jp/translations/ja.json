@@ -31,7 +31,7 @@
   },
   "entity": {
     "sensor": {
-      "usage": { "name": "Octopus Energy Usage" },
+      "usage": { "name": "使用量(前日)" },
       "yesterday_kwh": { "name": "昨日の使用量" },
       "today_kwh": { "name": "当日の使用量" },
       "month_kwh": { "name": "当月の使用量" },

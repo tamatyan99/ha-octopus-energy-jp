@@ -1,1 +1,13 @@
-{"domain": "octopus_energy_jp", "name": "Octopus Energy Japan", "codeowners": ["@tamatyan99"], "config_flow": true, "dependencies": ["recorder"], "documentation": "https://github.com/tamatyan99/ha-octopus-energy-jp", "integration_type": "service", "iot_class": "cloud_polling", "issue_tracker": "https://github.com/tamatyan99/ha-octopus-energy-jp/issues", "requirements": [], "version": "0.1.0"}
+{
+  "domain": "octopus_energy_jp",
+  "name": "Octopus Energy Japan",
+  "codeowners": ["@tamatyan99"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/tamatyan99/ha-octopus-energy-jp",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/tamatyan99/ha-octopus-energy-jp/issues",
+  "requirements": [],
+  "version": "0.2.0"
+}

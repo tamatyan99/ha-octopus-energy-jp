@@ -17,8 +17,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_ACCOUNT_NUMBER, DOMAIN
+from .const import CONF_ACCOUNT_NUMBER, DOMAIN, MAX_DAILY_ATTRIBUTE_DAYS
 from .coordinator import OctopusEnergyJpCoordinator
+
+# 30分値系列の属性上限: 1日48点 × 前日+当日バッファ相当
+MAX_SERIES_ATTRIBUTE_POINTS = 96
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -61,14 +64,13 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="month_kwh",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
         value_fn=lambda d: d["month_kwh"],
     ),
     OctopusSensorDescription(
         key="diff_kwh",
         translation_key="diff_kwh",
-        device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
@@ -86,7 +88,6 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
     OctopusSensorDescription(
         key="month_diff_kwh",
         translation_key="month_diff_kwh",
-        device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
@@ -97,6 +98,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="cost_yesterday",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_yesterday"],
     ),
@@ -105,6 +107,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="cost_today",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_today"],
     ),
@@ -113,6 +116,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="cost_month",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_month"],
     ),
@@ -121,6 +125,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="prev_month_cost",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
         value_fn=lambda d: d["prev_month_cost"],
     ),
@@ -159,7 +164,7 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
             identifiers={(DOMAIN, account)},
             name=f"Octopus Energy ({account})",
             manufacturer="Octopus Energy Japan",
-            model=coordinator.data.get("plan_name") if coordinator.data else None,
+            model="Electricity",
         )
 
     @property
@@ -167,7 +172,10 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
         """Return the sensor value from coordinator data."""
         if self.coordinator.data is None:
             return None
-        return self.entity_description.value_fn(self.coordinator.data)
+        try:
+            return self.entity_description.value_fn(self.coordinator.data)
+        except (KeyError, TypeError):
+            return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -175,22 +183,25 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
         if self.entity_description.key != "usage" or self.coordinator.data is None:
             return None
         d = self.coordinator.data
+        daily = d.get("daily") or []
+        yesterday_series = d.get("yesterday_series") or []
+        today_series = d.get("today_series") or []
         return {
-            "today_kwh": d["today_kwh"],
-            "month_kwh": d["month_kwh"],
-            "diff_kwh": d["diff_kwh"],
-            "diff_pct": d["diff_pct"],
-            "avg_rate": d["avg_rate"],
-            "cost_yesterday": d["cost_yesterday"],
-            "cost_today": d["cost_today"],
-            "cost_month": d["cost_month"],
-            "prev_month_kwh": d["prev_month_kwh"],
-            "prev_month_cost": d["prev_month_cost"],
-            "month_diff_kwh": d["month_diff_kwh"],
-            "month_diff_pct": d["month_diff_pct"],
-            "daily": d["daily"],
-            "yesterday_series": d["yesterday_series"],
-            "today_series": d["today_series"],
-            "plan_name": d["plan_name"],
-            "last_update": d["last_update"],
+            "today_kwh": d.get("today_kwh"),
+            "month_kwh": d.get("month_kwh"),
+            "diff_kwh": d.get("diff_kwh"),
+            "diff_pct": d.get("diff_pct"),
+            "avg_rate": d.get("avg_rate"),
+            "cost_yesterday": d.get("cost_yesterday"),
+            "cost_today": d.get("cost_today"),
+            "cost_month": d.get("cost_month"),
+            "prev_month_kwh": d.get("prev_month_kwh"),
+            "prev_month_cost": d.get("prev_month_cost"),
+            "month_diff_kwh": d.get("month_diff_kwh"),
+            "month_diff_pct": d.get("month_diff_pct"),
+            "daily": daily[-MAX_DAILY_ATTRIBUTE_DAYS:],
+            "yesterday_series": yesterday_series[-MAX_SERIES_ATTRIBUTE_POINTS:],
+            "today_series": today_series[-MAX_SERIES_ATTRIBUTE_POINTS:],
+            "plan_name": d.get("plan_name"),
+            "last_update": d.get("last_update"),
         }

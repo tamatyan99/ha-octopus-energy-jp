@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -12,10 +13,12 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
+from . import utils
 from .api import OctopusApiError, OctopusAuthError, OctopusEnergyJpApiClient
 from .const import (
     CONF_ACCOUNT_NUMBER,
     DOMAIN,
+    MAX_DAILY_DAYS,
     STATIC_CACHE_TTL,
     STORAGE_VERSION,
     UPDATE_INTERVAL,
@@ -24,20 +27,41 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-def _tiered_cost(total_kwh: float, rates: list[dict[str, Any]]) -> float:
-    """Compute the tiered monthly energy charge for a total consumption."""
-    cost = 0.0
-    for rate in rates:
-        # API は数値を文字列で返すことがあるため明示的に float 化する
-        step_start = float(rate.get("stepStart") or 0.0)
-        raw_end = rate.get("stepEnd")
-        step_end = float(raw_end) if raw_end is not None else None
-        price = float(rate.get("pricePerUnitIncTax") or 0.0)
-        if total_kwh <= step_start:
-            break
-        upper = total_kwh if step_end is None else min(total_kwh, step_end)
-        cost += (upper - step_start) * price
-    return cost
+def _tiered_cost(
+    total_kwh: float, rates: list[dict[str, Any]] | list[utils.RateTier]
+) -> float:
+    """Legacy wrapper kept for backward compatibility; delegates to utils."""
+    if not rates:
+        return 0.0
+    if isinstance(rates[0], dict):
+        normalized = utils.normalize_rates(rates)  # type: ignore[arg-type]
+    else:
+        normalized = rates  # type: ignore[assignment]
+    return utils.tiered_cost(total_kwh, normalized)
+
+
+def _coerce_rates(raw_rates: Any) -> list[utils.RateTier]:
+    """Accept normalized tuples or legacy dicts; return normalized tuples."""
+    if not isinstance(raw_rates, list) or not raw_rates:
+        raise ValueError("No usable consumption rates")
+    if isinstance(raw_rates[0], dict):
+        return utils.normalize_rates(raw_rates)
+    clean: list[utils.RateTier] = []
+    for item in raw_rates:
+        if isinstance(item, (list, tuple)) and len(item) == 3:
+            try:
+                start = float(item[0])
+                end = float(item[1]) if item[1] is not None else None
+                price = float(item[2])
+            except (TypeError, ValueError):
+                continue
+            if end is not None and end <= start:
+                continue
+            clean.append((start, end, price))
+    if not clean:
+        raise ValueError("No usable consumption rates")
+    clean.sort(key=lambda tier: tier[0])
+    return clean
 
 
 class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -57,7 +81,7 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.account_number: str = entry.data[CONF_ACCOUNT_NUMBER]
         self._static_fetched_at: datetime | None = None
         self._contract: dict[str, Any] | None = None
-        self._rates: list[dict[str, Any]] | None = None
+        self._rates: list[utils.RateTier] | None = None
         # API の保持期間（約1か月）を補う日次履歴の永続ストア
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}_daily"
@@ -65,12 +89,39 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._stored_days: dict[str, float] = {}
 
     async def async_load(self) -> None:
-        """Restore the persisted daily history."""
-        data = await self._store.async_load()
-        if data:
-            self._stored_days = {
-                d: float(v) for d, v in data.get("days", {}).items()
-            }
+        """Restore the persisted daily history (corruption-tolerant)."""
+        try:
+            data = await self._store.async_load()
+        except Exception as err:  # noqa: BLE001 - store backend failure
+            _LOGGER.warning("Failed to load daily history, starting fresh: %s", err)
+            self._stored_days = {}
+            return
+        if not data:
+            return
+        if not isinstance(data, dict):
+            _LOGGER.warning("Ignoring corrupt daily history, starting fresh")
+            self._stored_days = {}
+            return
+        raw_days = data.get("days")
+        if not isinstance(raw_days, dict):
+            _LOGGER.warning("Ignoring corrupt daily history, starting fresh")
+            self._stored_days = {}
+            return
+        cleaned: dict[str, float] = {}
+        corrupt = False
+        for day, val in raw_days.items():
+            try:
+                num = float(val)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                corrupt = True
+                continue
+            if not math.isfinite(num):
+                corrupt = True
+                continue
+            cleaned[str(day)] = num
+        if corrupt:
+            _LOGGER.warning("Ignoring corrupt daily entries, keeping valid ones")
+        self._stored_days = cleaned
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -79,6 +130,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ConfigEntryAuthFailed from err
         except OctopusApiError as err:
             raise UpdateFailed(f"API error: {err}") from err
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as err:
+            raise UpdateFailed(f"Data error: {err}") from err
 
     async def _async_fetch(self) -> dict[str, Any]:
         now = dt_util.now()
@@ -87,13 +140,41 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._static_fetched_at is None
             or now - self._static_fetched_at > STATIC_CACHE_TTL
         ):
-            self._contract = await self.api.async_get_contract(self.account_number)
-            self._rates = await self.api.async_get_tariff_rates(
-                self._contract["grid_operator_code"],
-                self._contract["product_code"],
-                self._contract["capacity_unit"],
-            )
-            self._static_fetched_at = now
+            try:
+                contract = await self.api.async_get_contract(self.account_number)
+                rates_raw = await self.api.async_get_tariff_rates(
+                    contract["grid_operator_code"],
+                    contract["product_code"],
+                    contract.get("capacity_unit", "")
+                    if isinstance(contract, dict)
+                    else "",
+                )
+                normalized_rates = _coerce_rates(rates_raw)
+            except OctopusAuthError:
+                raise
+            except (
+                OctopusApiError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+                AttributeError,
+            ) as err:
+                if self._contract is not None and self._rates is not None:
+                    _LOGGER.warning(
+                        "Static info refresh failed, using cached values: %s", err
+                    )
+                else:
+                    raise
+            else:
+                self._contract = contract
+                self._rates = normalized_rates
+                self._static_fetched_at = now
+
+        if self._contract is None or self._rates is None:
+            raise OctopusApiError("Contract or tariff rates unavailable")
+        rates = self._rates
+        contract = self._contract
 
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         # 日別料金グラフと統計バックフィルのため当月を含む過去3か月分を取得
@@ -103,20 +184,69 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             back_month += 12
             back_year -= 1
         from_dt = month_start.replace(year=back_year, month=back_month)
-        readings = await self.api.async_get_readings(
-            self.account_number, from_dt, now
-        )
+        readings: list[dict[str, Any]] = []
+        chunks = utils.chunk_date_range(from_dt, now, days=7)
+        failed_chunks = 0
+        for chunk_start, chunk_end in chunks:
+            try:
+                part = await self.api.async_get_readings(
+                    self.account_number, chunk_start, chunk_end, limit=5000
+                )
+            except OctopusAuthError:
+                raise
+            except (
+                OctopusApiError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+                AttributeError,
+            ) as err:
+                failed_chunks += 1
+                _LOGGER.warning(
+                    "Readings chunk %s-%s failed, skipping: %s",
+                    chunk_start,
+                    chunk_end,
+                    err,
+                )
+                continue
+            if isinstance(part, list):
+                readings.extend(part)
+        if chunks and failed_chunks >= len(chunks):
+            raise OctopusApiError("All readings chunks failed")
 
         # 30分値をローカル日付・ローカル時間枠に集計
         daily_kwh: dict[str, float] = {}
         hourly_kwh: dict[datetime, float] = {}
         series_by_day: dict[str, list[dict[str, Any]]] = {}
         for r in readings:
-            start = dt_util.parse_datetime(r["startAt"])
-            if start is None:
+            if not isinstance(r, dict):
                 continue
-            start_local = dt_util.as_local(start)
-            value = float(r["value"])
+            raw_start = r.get("startAt")
+            raw_value = r.get("value")
+            if raw_start is None or raw_value is None:
+                continue
+            if isinstance(raw_start, datetime):
+                start = raw_start
+            elif isinstance(raw_start, str):
+                try:
+                    start = dt_util.parse_datetime(raw_start)
+                except Exception:  # noqa: BLE001 - defensive parse
+                    continue
+                if start is None:
+                    continue
+            else:
+                continue
+            try:
+                value = float(raw_value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            try:
+                start_local = dt_util.as_local(start)
+            except Exception:  # noqa: BLE001 - defensive tz conversion
+                continue
             day = start_local.strftime("%Y-%m-%d")
             daily_kwh[day] = daily_kwh.get(day, 0.0) + value
             hour_start = start_local.replace(minute=0, second=0, microsecond=0)
@@ -127,8 +257,12 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # API保持期間より古い日付はストアの値で補完し、最新値で更新して永続化
         self._stored_days.update(daily_kwh)
+        self._stored_days = utils.prune_days(self._stored_days, MAX_DAILY_DAYS)
         daily_kwh = dict(self._stored_days)
-        await self._store.async_save({"days": self._stored_days})
+        try:
+            await self._store.async_save({"days": self._stored_days})
+        except Exception as err:  # noqa: BLE001 - persistence must not fail update
+            _LOGGER.warning("Failed to save daily history: %s", err)
 
         yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         day_before = (now - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -145,13 +279,13 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         diff_kwh = round(yesterday_kwh - day_before_kwh, 1)
         diff_pct = round(diff_kwh / day_before_kwh * 100) if day_before_kwh else None
 
-        # 按比例: 平均単価 = 段階制月額 ÷ 月次使用量。各日料金 = 日次使用量 × その月の平均単価
+        # 平均単価 = 段階制月額 ÷ 月次使用量。各日の料金 = 日次使用量 × その月の平均単価
         # 過去月の料金は現在の単価表による近似（単価改定は考慮しない）
         monthly_kwh: dict[str, float] = {}
         for d, kwh in daily_kwh.items():
             monthly_kwh[d[:7]] = monthly_kwh.get(d[:7], 0.0) + kwh
         avg_rate_by_month = {
-            m: (_tiered_cost(total, self._rates) / total if total else 0.0)
+            m: (utils.tiered_cost(total, rates) / total if total else 0.0)
             for m, total in monthly_kwh.items()
         }
         avg_rate = avg_rate_by_month.get(month_start.strftime("%Y-%m"), 0.0)
@@ -218,6 +352,6 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 {"start": start, "kwh": kwh}
                 for start, kwh in sorted(hourly_kwh.items())
             ],
-            "plan_name": self._contract["plan_name"],
+            "plan_name": contract.get("plan_name"),
             "last_update": now.isoformat(),
         }

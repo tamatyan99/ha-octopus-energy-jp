@@ -1,0 +1,47 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Octopus Energy Japan",
+        "description": "オクトパスエナジーのアカウントのメールアドレスとパスワードを入力してください。",
+        "data": {
+          "email": "メールアドレス",
+          "password": "パスワード"
+        }
+      },
+      "reauth_confirm": {
+        "title": "再認証",
+        "description": "認証情報が無効になりました。再度ログインしてください。",
+        "data": {
+          "email": "メールアドレス",
+          "password": "パスワード"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "認証に失敗しました",
+      "cannot_connect": "接続できません",
+      "unknown": "予期しないエラーが発生しました",
+      "account_mismatch": "別のアカウントの認証情報です"
+    },
+    "abort": {
+      "already_configured": "このサービスはすでに設定されています",
+      "reauth_successful": "再認証に成功しました"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "usage": { "name": "Octopus Energy Usage" },
+      "yesterday_kwh": { "name": "昨日の使用量" },
+      "today_kwh": { "name": "当日の使用量" },
+      "month_kwh": { "name": "当月の使用量" },
+      "diff_kwh": { "name": "前日比較" },
+      "prev_month_kwh": { "name": "前月の使用量" },
+      "month_diff_kwh": { "name": "前月比較" },
+      "cost_yesterday": { "name": "昨日の料金" },
+      "cost_today": { "name": "当日の料金" },
+      "cost_month": { "name": "当月の料金" },
+      "prev_month_cost": { "name": "前月の料金" }
+    }
+  }
+}

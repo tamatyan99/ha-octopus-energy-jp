@@ -1,0 +1,47 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Octopus Energy Japan",
+        "description": "Sign in with the email address and password of your Octopus Energy account.",
+        "data": {
+          "email": "[%key:common::config_flow::data::email%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate",
+        "description": "Your credentials are no longer valid. Please sign in again.",
+        "data": {
+          "email": "[%key:common::config_flow::data::email%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "account_mismatch": "The credentials belong to a different account."
+    },
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "usage": { "name": "Octopus Energy Usage" },
+      "yesterday_kwh": { "name": "Yesterday usage" },
+      "today_kwh": { "name": "Today usage" },
+      "month_kwh": { "name": "Month usage" },
+      "diff_kwh": { "name": "Day-over-day difference" },
+      "prev_month_kwh": { "name": "Previous month usage" },
+      "month_diff_kwh": { "name": "Month-over-month difference" },
+      "cost_yesterday": { "name": "Yesterday cost" },
+      "cost_today": { "name": "Today cost" },
+      "cost_month": { "name": "Month cost" },
+      "prev_month_cost": { "name": "Previous month cost" }
+    }
+  }
+}

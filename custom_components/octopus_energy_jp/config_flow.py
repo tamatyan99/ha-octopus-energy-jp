@@ -1,4 +1,5 @@
 """Config flow for Octopus Energy Japan."""
+
 from __future__ import annotations
 
 import logging
@@ -60,7 +61,7 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return {"base": "invalid_auth"}, None
         except OctopusApiError:
             return {"base": "cannot_connect"}, None
-        except Exception:  # noqa: BLE001
+        except Exception:
             _LOGGER.exception("Unexpected error during validation")
             return {"base": "unknown"}, None
         return {}, account
@@ -173,16 +174,21 @@ class OctopusEnergyJpOptionsFlow(config_entries.OptionsFlowWithConfigEntry):
     ) -> config_entries.ConfigFlowResult:
         """Show the surcharge options form."""
         if user_input is not None:
-            cleaned = {
-                key: float(user_input[key])
-                for key in (
-                    CONF_BASIC_CHARGE_PER_DAY,
-                    CONF_FUEL_ADJUSTMENT_PER_KWH,
-                    CONF_RENEWABLE_LEVY_PER_KWH,
-                )
-                if user_input.get(key) is not None
-            }
+            cleaned: dict[str, float] = {}
+            for key in (
+                CONF_BASIC_CHARGE_PER_DAY,
+                CONF_FUEL_ADJUSTMENT_PER_KWH,
+                CONF_RENEWABLE_LEVY_PER_KWH,
+            ):
+                raw = user_input.get(key)
+                if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+                    continue
+                try:
+                    cleaned[key] = float(raw)
+                except (TypeError, ValueError):
+                    continue
             return self.async_create_entry(title="", data=cleaned)
         return self.async_show_form(
-            step_id="init", data_schema=_options_schema(dict(self._options_entry.options))
+            step_id="init",
+            data_schema=_options_schema(dict(self._options_entry.options)),
         )

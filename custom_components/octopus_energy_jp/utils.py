@@ -3,6 +3,7 @@
 This module has no Home Assistant imports so it can be unit-tested
 with plain pytest.
 """
+
 from __future__ import annotations
 
 import math
@@ -56,9 +57,8 @@ def normalize_rates(raw_rates: list[dict[str, Any]]) -> list[RateTier]:
             continue
         if not math.isfinite(start) or not math.isfinite(price):
             continue
-        if end is not None:
-            if not math.isfinite(end) or end <= start:
-                continue
+        if end is not None and (not math.isfinite(end) or end <= start):
+            continue
         clean.append((start, end, price))
     if not clean:
         raise ValueError("No usable consumption rates")
@@ -164,8 +164,10 @@ def select_latest_bill(bills: Any) -> dict[str, Any] | None:
     Accepts either ``{"edges": [{"node": {...}}, ...]}`` or a bare list of
     nodes (defensive: the orderBy enum name may differ per schema, so the
     issuedDate sort is redone locally). STATEMENT/INVOICE bills are
-    preferred; the latest one by issuedDate wins. Returns None for
-    empty/malformed payloads without raising (except on non-dict access
+    preferred over adjustment/credit notes, so when the newest bill is an
+    OTHER-type entry an older STATEMENT period may be selected; the
+    ``bill_type`` in the result identifies which one was used. Returns None
+    for empty/malformed payloads without raising (except on non-dict access
     errors, which the caller guards).
     """
     if isinstance(bills, dict):

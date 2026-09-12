@@ -1,4 +1,5 @@
 """Unit tests for the HA-independent utils module."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -83,7 +84,7 @@ def test_chunk_date_range() -> None:
     ]
     assert chunks[-1][1] == end
     # contiguous, no gaps or overlaps
-    for ( _s1, e1), (s2, _e2) in zip(chunks, chunks[1:]):
+    for (_s1, e1), (s2, _e2) in zip(chunks, chunks[1:], strict=False):
         assert e1 == s2
     assert utils.chunk_date_range(start, start) == []
     assert len(utils.chunk_date_range(start, start + timedelta(hours=1))) == 1
@@ -301,3 +302,254 @@ def test_compute_billing_no_overlap_returns_none() -> None:
         )
         is None
     )
+
+
+def test_deduplicate_readings_smaller_version_later_keeps_first() -> None:
+    readings = [
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 9.0, "version": 5},
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1.0, "version": 2},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 9.0
+    assert result[0]["version"] == 5
+
+
+def test_deduplicate_readings_incomparable_versions_later_wins() -> None:
+    readings = [
+        {"startAt": "t", "value": 1, "version": 1},
+        {"startAt": "t", "value": 2, "version": "v2"},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 2
+    # reverse direction is also later-wins
+    readings_rev = [
+        {"startAt": "t", "value": 1, "version": "v1"},
+        {"startAt": "t", "value": 2, "version": 2},
+    ]
+    result_rev = utils.deduplicate_readings(readings_rev)
+    assert len(result_rev) == 1
+    assert result_rev[0]["value"] == 2
+
+
+def test_deduplicate_readings_equal_version_later_wins() -> None:
+    readings = [
+        {"startAt": "t", "value": 1, "version": 2},
+        {"startAt": "t", "value": 2, "version": 2},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 2
+
+
+def test_deduplicate_readings_one_sided_missing_version_later_wins() -> None:
+    first_missing = [
+        {"startAt": "t", "value": 1},
+        {"startAt": "t", "value": 2, "version": 3},
+    ]
+    assert utils.deduplicate_readings(first_missing)[0]["value"] == 2
+    second_missing = [
+        {"startAt": "t", "value": 1, "version": 3},
+        {"startAt": "t", "value": 2},
+    ]
+    assert utils.deduplicate_readings(second_missing)[0]["value"] == 2
+
+
+def test_deduplicate_readings_sorts_unsorted_input() -> None:
+    readings = [
+        {"startAt": "2026-01-01T01:00:00+09:00", "value": 2},
+        {"startAt": "2026-01-01T00:00:00+09:00", "value": 1},
+        {"startAt": "2026-01-01T00:30:00+09:00", "value": 1.5},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert [r["startAt"] for r in result] == [
+        "2026-01-01T00:00:00+09:00",
+        "2026-01-01T00:30:00+09:00",
+        "2026-01-01T01:00:00+09:00",
+    ]
+
+
+def test_deduplicate_readings_three_duplicates_fold_to_largest() -> None:
+    readings = [
+        {"startAt": "t", "value": 1, "version": 1},
+        {"startAt": "t", "value": 2, "version": 2},
+        {"startAt": "t", "value": 3, "version": 3},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 3
+    assert result[0]["version"] == 3
+
+
+def test_compute_billing_invalid_to_falls_back_to_matched_count() -> None:
+    daily = {"2026-07-01": 10.0, "2026-07-02": 20.0}
+    rates = [(0.0, None, 30.0)]
+    billing = utils.compute_billing(
+        daily, rates, "2026-07-01", "not-a-date", "bill", 40.0, 2.0, 3.0
+    )
+    assert billing is not None
+    assert billing["kwh"] == 30.0
+    assert billing["days"] == 2
+    assert billing["from"] == "2026-07-01"
+    assert billing["to"] == "not-a-date"
+    assert billing["energy_cost"] == 900
+    assert billing["total"] == 900 + 80 + 60 + 90
+
+
+def test_compute_billing_invalid_from_yields_none_when_no_overlap() -> None:
+    daily = {"2026-07-01": 10.0, "2026-07-02": 20.0}
+    rates = [(0.0, None, 30.0)]
+    assert (
+        utils.compute_billing(
+            daily, rates, "not-a-date", "2026-07-31", "bill", 0.0, 0.0, 0.0
+        )
+        is None
+    )
+    assert (
+        utils.compute_billing(daily, rates, "bad", "also-bad", "bill", 0.0, 0.0, 0.0)
+        is None
+    )
+
+
+def test_compute_billing_empty_from_falls_back_to_matched_count() -> None:
+    daily = {"2026-07-01": 10.0, "2026-07-02": 20.0}
+    rates = [(0.0, None, 30.0)]
+    billing = utils.compute_billing(
+        daily, rates, "", "2026-07-31", "bill", 0.0, 0.0, 0.0
+    )
+    assert billing is not None
+    assert billing["days"] == 2
+    assert billing["kwh"] == 30.0
+    # empty `to` sorts before any daily key, so nothing overlaps
+    assert (
+        utils.compute_billing(daily, rates, "2026-07-01", "", "bill", 0.0, 0.0, 0.0)
+        is None
+    )
+
+
+def test_select_latest_bill_skips_missing_to_date() -> None:
+    bills = _bill_edges(
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-07-01",
+            "issuedDate": "2026-08-01",
+        },
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+            "issuedDate": "2026-08-02",
+        },
+    )
+    result = utils.select_latest_bill(bills)
+    assert result is not None
+    assert result["to_date"] == "2026-07-31"
+    # all nodes missing toDate -> None
+    assert (
+        utils.select_latest_bill(
+            _bill_edges({"billType": "STATEMENT", "fromDate": "2026-07-01"})
+        )
+        is None
+    )
+
+
+def test_select_latest_bill_prefers_invoice_over_other() -> None:
+    bills = _bill_edges(
+        {
+            "billType": "OTHER",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+            "issuedDate": "2026-08-10",
+        },
+        {
+            "billType": "INVOICE",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+            "issuedDate": "2026-08-01",
+        },
+    )
+    result = utils.select_latest_bill(bills)
+    assert result is not None
+    assert result["bill_type"] == "INVOICE"
+
+
+def test_select_latest_bill_other_only_picks_newest_issued() -> None:
+    bills = _bill_edges(
+        {
+            "billType": "OTHER",
+            "fromDate": "2026-06-01",
+            "toDate": "2026-06-30",
+            "issuedDate": "2026-07-05",
+        },
+        {
+            "billType": "OTHER",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+            "issuedDate": "2026-08-05",
+        },
+    )
+    result = utils.select_latest_bill(bills)
+    assert result is not None
+    assert result["from_date"] == "2026-07-01"
+
+
+def test_select_latest_bill_missing_issued_date() -> None:
+    bills = _bill_edges(
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-06-01",
+            "toDate": "2026-06-30",
+        },
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+            "issuedDate": "2026-08-05",
+        },
+    )
+    result = utils.select_latest_bill(bills)
+    assert result is not None
+    assert result["from_date"] == "2026-07-01"
+    # both missing issuedDate -> first node wins, issued_date is None
+    both_missing = _bill_edges(
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-06-01",
+            "toDate": "2026-06-30",
+        },
+        {
+            "billType": "STATEMENT",
+            "fromDate": "2026-07-01",
+            "toDate": "2026-07-31",
+        },
+    )
+    result_both = utils.select_latest_bill(both_missing)
+    assert result_both is not None
+    assert result_both["from_date"] == "2026-06-01"
+    assert result_both["issued_date"] is None
+
+
+def test_select_latest_bill_edges_not_list_returns_none() -> None:
+    assert utils.select_latest_bill({"edges": "x"}) is None
+    assert utils.select_latest_bill({"edges": {"a": 1}}) is None
+    assert utils.select_latest_bill({"edges": None}) is None
+
+
+def test_parse_day_non_str_returns_none() -> None:
+    assert utils.parse_day(123) is None
+    assert utils.parse_day(20260701) is None
+    assert utils.parse_day(["2026-07-01"]) is None
+    assert utils.parse_day({"d": "2026-07-01"}) is None
+    assert utils.parse_day(("2026-07-01",)) is None
+    assert utils.parse_day(0.0) is None
+
+
+def test_coerce_option_float_int_blank_and_containers() -> None:
+    assert utils.coerce_option_float(5) == 5.0
+    assert utils.coerce_option_float(0) == 0.0
+    assert utils.coerce_option_float(-3) == -3.0
+    assert utils.coerce_option_float("   ") == 0.0
+    assert utils.coerce_option_float(" 12.5 ") == 12.5
+    assert utils.coerce_option_float([1]) == 0.0
+    assert utils.coerce_option_float({"a": 1}) == 0.0

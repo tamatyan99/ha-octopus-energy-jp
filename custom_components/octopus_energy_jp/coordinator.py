@@ -1,8 +1,10 @@
 """Data update coordinator for Octopus Energy Japan."""
+
 from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -115,6 +117,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cleaned: dict[str, float] = {}
         corrupt = False
         for day, val in raw_days.items():
+            if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                corrupt = True
+                continue
             try:
                 num = float(val)  # type: ignore[arg-type]
             except (TypeError, ValueError):
@@ -123,7 +128,7 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not math.isfinite(num):
                 corrupt = True
                 continue
-            cleaned[str(day)] = num
+            cleaned[day] = num
         if corrupt:
             _LOGGER.warning("Ignoring corrupt daily entries, keeping valid ones")
         self._stored_days = cleaned
@@ -181,7 +186,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         rates = self._rates
         contract = self._contract
 
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)        # 日別料金グラフと統計バックフィルのため当月を含む過去3か月分を取得
+        # 日別料金グラフと統計バックフィルのため当月を含む過去3か月分を取得
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         back_year = month_start.year
         back_month = month_start.month - 2
         if back_month <= 0:
@@ -278,7 +284,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         day_before_kwh = daily_kwh.get(day_before, 0.0)
         today_kwh = round(daily_kwh.get(today, 0.0), 1)
         month_kwh = round(
-            sum(v for d, v in daily_kwh.items() if d >= month_start.strftime("%Y-%m-%d")),
+            sum(
+                v for d, v in daily_kwh.items() if d >= month_start.strftime("%Y-%m-%d")
+            ),
             1,
         )
 
@@ -295,7 +303,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for m, total in monthly_kwh.items()
         }
         avg_rate = avg_rate_by_month.get(month_start.strftime("%Y-%m"), 0.0)
-        cost_yesterday = round(yesterday_kwh * avg_rate_by_month.get(yesterday[:7], 0.0))
+        cost_yesterday = round(
+            yesterday_kwh * avg_rate_by_month.get(yesterday[:7], 0.0)
+        )
         cost_today = round(today_kwh * avg_rate_by_month.get(today[:7], 0.0))
         cost_month = round(month_kwh * avg_rate)
 
@@ -306,7 +316,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             round(monthly_kwh[prev_month_key], 1) if has_prev_month else None
         )
         prev_month_cost = (
-            round(monthly_kwh[prev_month_key] * avg_rate_by_month.get(prev_month_key, 0.0))
+            round(
+                monthly_kwh[prev_month_key] * avg_rate_by_month.get(prev_month_key, 0.0)
+            )
             if has_prev_month
             else None
         )
@@ -345,7 +357,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except OctopusAuthError:
             raise
         except Exception as err:  # noqa: BLE001 - bills failure must not fail update
-            _LOGGER.warning("Latest bill fetch failed, skipping billing period: %s", err)
+            _LOGGER.warning(
+                "Latest bill fetch failed, skipping billing period: %s", err
+            )
             latest_bill = None
 
         billing_period: dict[str, Any] | None = None
@@ -368,7 +382,9 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     to_day,
                     "bill",
                     utils.coerce_option_float(options.get(CONF_BASIC_CHARGE_PER_DAY)),
-                    utils.coerce_option_float(options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)),
+                    utils.coerce_option_float(
+                        options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)
+                    ),
                     utils.coerce_option_float(options.get(CONF_RENEWABLE_LEVY_PER_KWH)),
                 )
 

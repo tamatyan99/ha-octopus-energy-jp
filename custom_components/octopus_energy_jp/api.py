@@ -1,4 +1,5 @@
 """Async GraphQL API client for Octopus Energy Japan (Kraken)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -31,9 +32,9 @@ def _is_auth_error(message: str) -> bool:
     """Return True when a GraphQL error message indicates an auth failure."""
     lowered = message.lower()
     return any(
-        re.search(r"\b" + re.escape(hint) + r"\b", lowered)
-        for hint in AUTH_ERROR_HINTS
+        re.search(r"\b" + re.escape(hint) + r"\b", lowered) for hint in AUTH_ERROR_HINTS
     )
+
 
 AUTH_MUTATION = """
 mutation obtainKrakenToken($input: ObtainJSONWebTokenInput!) {
@@ -62,7 +63,9 @@ query contractInfo($accountNumber: String!) {
 """
 
 READINGS_QUERY = """
-query halfHourlyReadings($accountNumber: String!, $fromDatetime: DateTime, $toDatetime: DateTime) {
+query halfHourlyReadings(
+  $accountNumber: String!, $fromDatetime: DateTime, $toDatetime: DateTime
+) {
   account(accountNumber: $accountNumber) {
     properties {
       electricitySupplyPoints {
@@ -134,7 +137,15 @@ class OctopusEnergyJpApiClient:
 
     async def _async_authenticate(self) -> None:
         payload = await self._async_post(
-            {"query": AUTH_MUTATION, "variables": {"input": {"email": self._email, "password": self._password}}},
+            {
+                "query": AUTH_MUTATION,
+                "variables": {
+                    "input": {
+                        "email": self._email,
+                        "password": self._password,
+                    }
+                },
+            },
             authenticated=False,
         )
         token: Any = None
@@ -149,18 +160,23 @@ class OctopusEnergyJpApiClient:
             if isinstance(payload, dict):
                 _LOGGER.debug(
                     "Unexpected auth response structure (top-level keys: %s)",
-                    sorted(str(key) for key in payload.keys()),
+                    sorted(str(key) for key in payload),
                 )
             raise OctopusApiError("Unexpected auth response structure")
         self._token = token
 
-    async def _async_post(self, body: dict[str, Any], authenticated: bool = True) -> dict[str, Any]:
+    async def _async_post(
+        self, body: dict[str, Any], authenticated: bool = True
+    ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if authenticated and self._token:
             headers["Authorization"] = f"JWT {self._token}"
         try:
             async with self._session.post(
-                API_URL, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+                API_URL,
+                json=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status in (401, 403):
                     raise OctopusAuthError(f"HTTP {resp.status}")
@@ -169,14 +185,16 @@ class OctopusEnergyJpApiClient:
                 try:
                     payload = await resp.json()
                 except (aiohttp.ClientError, ValueError) as err:
-                    raise OctopusApiError(f"Failed to decode JSON response: {err}") from err
+                    raise OctopusApiError(
+                        f"Failed to decode JSON response: {err}"
+                    ) from err
         except OctopusApiError:
             raise
         except asyncio.CancelledError:
             raise
         except KeyError:
             raise
-        except (asyncio.TimeoutError, aiohttp.ClientError, ValueError) as err:
+        except (TimeoutError, aiohttp.ClientError, ValueError) as err:
             raise OctopusApiError(f"Connection error: {err}") from err
         except Exception as err:
             raise OctopusApiError(f"Unexpected API error: {err}") from err
@@ -191,12 +209,17 @@ class OctopusEnergyJpApiClient:
         return payload
 
     async def _async_query(
-        self, query: str, variables: dict[str, Any] | None = None, _retried: bool = False
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        _retried: bool = False,
     ) -> dict[str, Any]:
         if not self._token:
             await self._async_authenticate()
         try:
-            payload = await self._async_post({"query": query, "variables": variables or {}})
+            payload = await self._async_post(
+                {"query": query, "variables": variables or {}}
+            )
         except OctopusAuthError:
             if _retried:
                 raise
@@ -239,7 +262,9 @@ class OctopusEnergyJpApiClient:
 
     async def async_get_contract(self, account_number: str) -> dict[str, Any]:
         """Return active product and supply point info."""
-        data = await self._async_query(CONTRACT_QUERY, {"accountNumber": account_number})
+        data = await self._async_query(
+            CONTRACT_QUERY, {"accountNumber": account_number}
+        )
         account = data.get("account")
         if not isinstance(account, dict):
             raise OctopusApiError("Unexpected contract response structure")
@@ -298,9 +323,7 @@ class OctopusEnergyJpApiClient:
             raise OctopusApiError("Unexpected readings response structure")
         return readings
 
-    async def async_get_latest_bill(
-        self, account_number: str
-    ) -> dict[str, Any] | None:
+    async def async_get_latest_bill(self, account_number: str) -> dict[str, Any] | None:
         """Return the most recent bill period, or None when unavailable.
 
         Prefers STATEMENT/INVOICE bills and picks the latest one by

@@ -1,4 +1,5 @@
 """External statistics importer for the Energy Dashboard."""
+
 from __future__ import annotations
 
 import logging

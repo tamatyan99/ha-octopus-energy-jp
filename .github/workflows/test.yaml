@@ -8,14 +8,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - run: pip install pytest
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements_test.txt
+      - run: ruff check --config pyproject.toml custom_components tests
+      - run: ruff format --check --config pyproject.toml custom_components tests
       - run: python -m compileall -q custom_components
-      - run: python -m pytest tests/ -q
+      - run: python -m pytest tests/ -q --cov=oejp_utils --cov-fail-under=90

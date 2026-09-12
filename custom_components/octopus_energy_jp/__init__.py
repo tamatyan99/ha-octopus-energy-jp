@@ -1,4 +1,5 @@
 """Octopus Energy Japan integration."""
+
 from __future__ import annotations
 
 import logging
@@ -10,7 +11,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import OctopusEnergyJpApiClient
-from .const import DOMAIN
 from .coordinator import OctopusEnergyJpCoordinator
 from .statistics import OctopusStatisticsImporter
 
@@ -45,9 +45,7 @@ def _hourly_signature(hourly: list) -> tuple:
             return (0, "")
 
 
-async def _async_reload_on_update(
-    hass: HomeAssistant, entry: ConfigEntry
-) -> None:
+async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload the entry when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
 
@@ -85,14 +83,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """例外を握り潰さずログに残す import ラッパー。"""
         try:
             await importer.async_import(hourly_data)
-        except Exception:  # noqa: BLE001 - バックグラウンドimportの失敗を記録
+        except Exception:
             _LOGGER.exception("統計のインポートに失敗しました")
 
     def _log_task_done(task) -> None:
         """fire-and-forget タスクの例外をログに出す。"""
         try:
             exc = task.exception()
-        except Exception:  # noqa: BLE001 - キャンセル時等の取得失敗
+        except Exception:
             _LOGGER.exception("インポートタスクの状態取得に失敗しました")
             return
         if exc is not None:

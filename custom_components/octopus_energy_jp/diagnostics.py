@@ -1,4 +1,5 @@
 """Diagnostics for the Octopus Energy Japan integration."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -45,7 +46,9 @@ async def async_get_config_entry_diagnostics(
     Secrets are never included; account number and email are masked.
     """
     coordinator = entry.runtime_data.get("coordinator") if entry.runtime_data else None
-    data: dict[str, Any] = dict(coordinator.data) if coordinator and coordinator.data else {}
+    data: dict[str, Any] = (
+        dict(coordinator.data) if coordinator and coordinator.data else {}
+    )
 
     summarized: dict[str, Any] = {}
     for key, value in data.items():
@@ -69,8 +72,10 @@ async def async_get_config_entry_diagnostics(
 
     diagnostics = {
         "entry": {
-            "title": async_redact_data(entry.title, TO_REDACT),
-            "data": async_redact_data(entry_data, TO_REDACT),
+            # title は "Octopus Energy (<口座番号>)" 形式のため口座部分をマスクする。
+            # async_redact_data は部分一致をマスクしないため自前マスクが必要。
+            "title": _mask_account_number(entry.title),
+            "data": redacted_entry,
         },
         "coordinator_data": async_redact_data(summarized, TO_REDACT),
     }

@@ -1,4 +1,5 @@
 """Constants for the Octopus Energy Japan integration."""
+
 from datetime import timedelta
 
 DOMAIN = "octopus_energy_jp"

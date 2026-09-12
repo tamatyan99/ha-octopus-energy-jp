@@ -1,0 +1,24 @@
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "BLE", "RUF100", "SIM102", "SIM118", "B905"]
+# RUF003(全角文字): 日本語コメント混在のため除外
+# DTZ(naive datetime): テストの日付リテラルで使用するため除外
+# S(bandit): HAカスタム連携では未使用のため除外
+ignore = ["RUF003", "DTZ", "S"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components"]
+
+[tool.coverage.run]
+source = ["custom_components/octopus_energy_jp"]
+omit = ["custom_components/octopus_energy_jp/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -37,15 +37,6 @@ class OctopusSensorDescription(SensorEntityDescription):
 
 SENSORS: tuple[OctopusSensorDescription, ...] = (
     OctopusSensorDescription(
-        key="usage",
-        translation_key="usage",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement="kWh",
-        state_class=None,
-        suggested_display_precision=1,
-        value_fn=lambda d: d["yesterday_kwh"],
-    ),
-    OctopusSensorDescription(
         key="yesterday_kwh",
         translation_key="yesterday_kwh",
         device_class=SensorDeviceClass.ENERGY,
@@ -226,8 +217,11 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Expose the full aggregate payload on the main sensor."""
-        if self.entity_description.key != "usage" or self.coordinator.data is None:
+        """集約ペイロードを yesterday_kwh センサーに付与する。"""
+        if (
+            self.entity_description.key != "yesterday_kwh"
+            or self.coordinator.data is None
+        ):
             return None
         d = self.coordinator.data
         daily = d.get("daily") or []

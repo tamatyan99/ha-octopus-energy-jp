@@ -8,6 +8,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 
@@ -62,6 +63,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = OctopusEnergyJpCoordinator(hass, entry, api)
     await coordinator.async_load()
     await coordinator.async_config_entry_first_refresh()
+
+    # v0.3.0 で削除した legacy `usage` センサーの残存レジストリエントリを掃除する。
+    try:
+        registry = er.async_get(hass)
+        legacy_entity_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{coordinator.account_number}_usage"
+        )
+        if legacy_entity_id is not None:
+            registry.async_remove(legacy_entity_id)
+            _LOGGER.info("Removed legacy duplicate sensor entity %s", legacy_entity_id)
+    except Exception as err:  # noqa: BLE001 - cleanup must not fail setup
+        _LOGGER.debug("Failed to remove legacy usage sensor entity: %s", err)
 
     # options 変更時はエントリをリロード（coordinator が最新 options を参照する）
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))

@@ -12,13 +12,12 @@ ignore = ["RUF003", "DTZ", "S"]
 [tool.ruff.lint.isort]
 known-first-party = ["custom_components"]
 
-[tool.coverage.run]
-source = ["custom_components/octopus_energy_jp"]
-omit = ["custom_components/octopus_energy_jp/__init__.py"]
-
 [tool.coverage.report]
 fail_under = 90
 show_missing = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pytest-homeassistant-custom-component は auto モード前提
+# (strict だと autouse の async fixture と衝突する)
+asyncio_mode = "auto"

@@ -1,7 +1,6 @@
 {
   "entity": {
     "sensor": {
-      "usage": { "default": "mdi:flash" },
       "yesterday_kwh": { "default": "mdi:counter" },
       "today_kwh": { "default": "mdi:counter" },
       "month_kwh": { "default": "mdi:counter" },

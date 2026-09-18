@@ -46,7 +46,7 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Return the options flow handler."""
-        return OctopusEnergyJpOptionsFlow(config_entry)
+        return OctopusEnergyJpOptionsFlow()
 
     async def _async_validate(
         self, email: str, password: str
@@ -123,51 +123,53 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 def _options_schema(current: dict[str, Any]) -> vol.Schema:
-    """Build the options schema, pre-filling current values."""
+    """Build the options schema, pre-filling current values.
 
-    def _suggest(key: str) -> Any:
+    未設定の項目に default=None を渡すと、その項目を送信しなくても
+    HA のスキーマ検証が失敗する（= 一部の項目だけ設定できない）。
+    そのため値がある項目にだけ default を付ける。
+    """
+
+    def _suggest(key: str) -> float | None:
         value = current.get(key)
         try:
             return float(value) if value is not None else None
         except (TypeError, ValueError):
             return None
 
-    return vol.Schema(
-        {
-            vol.Optional(
-                CONF_BASIC_CHARGE_PER_DAY, default=_suggest(CONF_BASIC_CHARGE_PER_DAY)
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
-                )
+    fields: dict[Any, Any] = {}
+    for key, config in (
+        (
+            CONF_BASIC_CHARGE_PER_DAY,
+            selector.NumberSelectorConfig(
+                min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
             ),
-            vol.Optional(
-                CONF_FUEL_ADJUSTMENT_PER_KWH,
-                default=_suggest(CONF_FUEL_ADJUSTMENT_PER_KWH),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    step=0.01, mode=selector.NumberSelectorMode.BOX
-                )
+        ),
+        (
+            CONF_FUEL_ADJUSTMENT_PER_KWH,
+            selector.NumberSelectorConfig(
+                step=0.01, mode=selector.NumberSelectorMode.BOX
             ),
-            vol.Optional(
-                CONF_RENEWABLE_LEVY_PER_KWH,
-                default=_suggest(CONF_RENEWABLE_LEVY_PER_KWH),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
-                )
+        ),
+        (
+            CONF_RENEWABLE_LEVY_PER_KWH,
+            selector.NumberSelectorConfig(
+                min=0, step=0.01, mode=selector.NumberSelectorMode.BOX
             ),
-        }
-    )
+        ),
+    ):
+        suggested = _suggest(key)
+        marker = (
+            vol.Optional(key)
+            if suggested is None
+            else vol.Optional(key, default=suggested)
+        )
+        fields[marker] = selector.NumberSelector(config)
+    return vol.Schema(fields)
 
 
-class OctopusEnergyJpOptionsFlow(config_entries.OptionsFlowWithConfigEntry):
+class OctopusEnergyJpOptionsFlow(config_entries.OptionsFlow):
     """Handle options for billing-period surcharges (all optional)."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Store the entry explicitly (base class keeps it private)."""
-        super().__init__(config_entry)
-        self._options_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -190,5 +192,5 @@ class OctopusEnergyJpOptionsFlow(config_entries.OptionsFlowWithConfigEntry):
             return self.async_create_entry(title="", data=cleaned)
         return self.async_show_form(
             step_id="init",
-            data_schema=_options_schema(dict(self._options_entry.options)),
+            data_schema=_options_schema(dict(self.config_entry.options)),
         )

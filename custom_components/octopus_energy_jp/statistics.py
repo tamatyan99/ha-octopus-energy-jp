@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from homeassistant.components.recorder.models import (
@@ -22,9 +22,6 @@ from .utils import statistic_id_for_account
 
 _LOGGER = logging.getLogger(__name__)
 
-# 旧単一アカウント時代の statistic_id（account_number 未指定時のフォールバック）
-LEGACY_STATISTIC_ID = f"{DOMAIN}:consumption"
-
 
 class OctopusStatisticsImporter:
     """Import confirmed hourly consumption into recorder statistics.
@@ -39,33 +36,90 @@ class OctopusStatisticsImporter:
 
     正規ルートでは coordinator.account_number を account_number 引数に渡す
     こと。各 config entry が自分専用の statistic_id を持つため、複数契約の
-    統計が互いを上書きしない。account_number 省略時は旧 ID にフォールバック
-    する後方互換モードとなる。
+    統計が互いを上書きしない。
     """
 
-    def __init__(
-        self, hass: HomeAssistant, entry_id: str, account_number: str | None = None
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, entry_id: str, account_number: str) -> None:
         self._hass = hass
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics"
         )
         self._account_number = account_number
-        if account_number:
-            self._statistic_id = statistic_id_for_account(DOMAIN, account_number)
-            self._statistic_name = (
-                f"Octopus Energy Japan consumption ({account_number})"
-            )
-        else:
-            _LOGGER.warning(
-                "OctopusStatisticsImporter without account_number; "
-                "falling back to legacy statistic id"
-            )
-            self._statistic_id = LEGACY_STATISTIC_ID
-            self._statistic_name = "Octopus Energy Japan consumption"
+        self._statistic_id = statistic_id_for_account(DOMAIN, account_number)
+        self._statistic_name = f"Octopus Energy Japan consumption ({account_number})"
         self._last_start: datetime | None = None
         self._earliest_start: datetime | None = None
         self._cumulative: float = 0.0
+
+    async def _recover_baseline_from_recorder(self) -> None:
+        """Seed import state from the recorder when the local store is gone.
+
+        Deleting and re-adding the config entry (new entry_id, same
+        statistic_id), a corrupt/missing store, or a storage version change
+        would otherwise restart the cumulative sum from 0 and overwrite
+        existing recorder rows with lower sums. Consult the recorder's last
+        stored row instead and continue from there.
+        """
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.statistics import (
+                get_last_statistics,
+            )
+
+            # get_last_statistics() は同期関数で、recorder の DB セッションを
+            # 直接開く。イベントループを塞がないよう executor 経由で呼ぶ。
+            # types は必須引数で、内部で in-place に削られるため毎回新しい
+            # set を渡す。convert_units=False は保存済みの生の sum を得るため
+            # (単位変換されると累積の連続性が崩れる)。
+            rows = await get_instance(self._hass).async_add_executor_job(
+                get_last_statistics,
+                self._hass,
+                1,
+                self._statistic_id,
+                False,
+                {"sum", "state"},
+            )
+        except Exception as err:  # noqa: BLE001 - recorder unavailable
+            _LOGGER.warning("Recorder baseline lookup failed, starting fresh: %s", err)
+            return
+        last_row: dict[str, Any] | None = None
+        if isinstance(rows, dict):
+            candidates = rows.get(self._statistic_id)
+            if isinstance(candidates, list) and candidates:
+                last_row = candidates[-1] if isinstance(candidates[-1], dict) else None
+        elif isinstance(rows, list) and rows:
+            last_row = rows[-1] if isinstance(rows[-1], dict) else None
+        if last_row is None:
+            return
+        try:
+            raw_start = last_row.get("start")
+            start_ms = float(raw_start)  # type: ignore[arg-type]
+            start = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
+        except (TypeError, ValueError, OverflowError, OSError):
+            _LOGGER.debug("Ignoring recorder baseline with unusable start: %r", rows)
+            return
+        raw_sum = last_row.get("sum")
+        try:
+            baseline = 0.0 if raw_sum is None else float(raw_sum)
+        except (TypeError, ValueError):
+            baseline = 0.0
+        if not math.isfinite(baseline):
+            baseline = 0.0
+        self._last_start = dt_util.as_local(start)
+        # NOTE: the true earliest imported hour is unknown (only the last row
+        # was queried), so seed a sentinel old enough that the "fetch window
+        # widened into the past" full re-import branch in async_import never
+        # fires on the recovered path. A from-0 full re-import over the ~1
+        # month API window would overwrite recorder rows that continue an
+        # older cumulative sum; only strictly newer buckets are imported.
+        self._earliest_start = dt_util.as_local(datetime(1970, 1, 1, tzinfo=UTC))
+        self._cumulative = baseline
+        _LOGGER.warning(
+            "Local statistics state was missing; recovered baseline from "
+            "recorder (statistic_id=%s, sum=%s)",
+            self._statistic_id,
+            baseline,
+        )
 
     async def async_load(self) -> None:
         """Restore persisted import state (corruption-tolerant)."""
@@ -73,11 +127,14 @@ class OctopusStatisticsImporter:
             data = await self._store.async_load()
         except Exception as err:  # noqa: BLE001 - store backend failure
             _LOGGER.warning("Failed to load statistics state, starting fresh: %s", err)
+            await self._recover_baseline_from_recorder()
             return
         if not data:
+            await self._recover_baseline_from_recorder()
             return
         if not isinstance(data, dict):
             _LOGGER.warning("Ignoring corrupt statistics state, starting fresh")
+            await self._recover_baseline_from_recorder()
             return
 
         raw_last = data.get("last_start", "")

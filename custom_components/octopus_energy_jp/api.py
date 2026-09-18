@@ -23,8 +23,15 @@ AUTH_ERROR_HINTS = (
     "jwt",
     "signature has expired",
     "token expired",
+    "expired",
     "invalid token",
+    "invalid credentials",
+    "invalid email or password",
+    "incorrect password",
+    "incorrect username",
     "authentication failed",
+    "access denied",
+    "not authorized",
 )
 
 
@@ -34,6 +41,25 @@ def _is_auth_error(message: str) -> bool:
     return any(
         re.search(r"\b" + re.escape(hint) + r"\b", lowered) for hint in AUTH_ERROR_HINTS
     )
+
+
+# GraphQL extensions.code values that indicate an auth failure.
+_AUTH_ERROR_CODES = frozenset({"UNAUTHENTICATED", "FORBIDDEN"})
+
+
+def _has_auth_error_code(errors: Any) -> bool:
+    """Return True when a GraphQL errors payload carries an auth failure code."""
+    items = errors if isinstance(errors, (list, tuple)) else [errors]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        extensions = item.get("extensions")
+        if not isinstance(extensions, dict):
+            continue
+        code = extensions.get("code")
+        if isinstance(code, str) and code.upper() in _AUTH_ERROR_CODES:
+            return True
+    return False
 
 
 AUTH_MUTATION = """
@@ -203,7 +229,7 @@ class OctopusEnergyJpApiClient:
         errors = payload.get("errors")
         if errors:
             message = str(errors)
-            if _is_auth_error(message):
+            if _is_auth_error(message) or _has_auth_error_code(errors):
                 raise OctopusAuthError(message)
             raise OctopusApiError(message)
         return payload

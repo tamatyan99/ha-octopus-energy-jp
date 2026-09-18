@@ -9,8 +9,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from .api import OctopusEnergyJpApiClient
+from .const import DOMAIN, STORAGE_VERSION
 from .coordinator import OctopusEnergyJpCoordinator
 from .statistics import OctopusStatisticsImporter
 
@@ -64,14 +66,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # options 変更時はエントリをリロード（coordinator が最新 options を参照する）
     entry.async_on_unload(entry.add_update_listener(_async_reload_on_update))
 
-    try:
-        # 新シグネチャ (hass, entry_id, account_number) に対応
-        importer = OctopusStatisticsImporter(
-            hass, entry.entry_id, coordinator.account_number
-        )
-    except (TypeError, AttributeError):
-        # 旧シグネチャ (hass, entry_id) の importer でも動作させる
-        importer = OctopusStatisticsImporter(hass, entry.entry_id)
+    importer = OctopusStatisticsImporter(
+        hass, entry.entry_id, coordinator.account_number
+    )
     await importer.async_load()
     last_signature: tuple | None = None
     hourly = _get_hourly(coordinator.data)
@@ -119,3 +116,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove persistent stores when the config entry is deleted."""
+    for key in (
+        f"{DOMAIN}_{entry.entry_id}_daily",
+        f"{DOMAIN}_{entry.entry_id}_statistics",
+    ):
+        try:
+            await Store(hass, STORAGE_VERSION, key).async_remove()
+        except Exception as err:  # noqa: BLE001 - missing store must not fail
+            _LOGGER.debug("Failed to remove store %s: %s", key, err)

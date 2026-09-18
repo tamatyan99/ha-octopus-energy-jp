@@ -18,7 +18,6 @@ STATIC_CACHE_TTL = timedelta(days=1)
 # Octopus Japan の30分値は約8時間遅れで届く。統計投入は確定済み枠のみにする
 STATS_IMPORT_BUFFER = timedelta(hours=8)
 
-STATISTIC_ID_CONSUMPTION_PREFIX = f"{DOMAIN}:"
 STORAGE_VERSION = 1
 # 日次履歴ストアの保持上限（無限肥大防止）
 MAX_DAILY_DAYS = 400

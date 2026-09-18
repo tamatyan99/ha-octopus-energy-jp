@@ -6,10 +6,13 @@ with plain pytest.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 # Normalized tariff tier: (step_start_kwh, step_end_kwh_or_None, price_per_kwh)
 RateTier = tuple[float, float | None, float]
@@ -39,10 +42,13 @@ def normalize_rates(raw_rates: list[dict[str, Any]]) -> list[RateTier]:
 
     Missing prices are tolerated as 0.0. Non-finite values (NaN/Inf),
     empty-string stepEnd values, and inverted tiers (end <= start) are
-    skipped. Duplicate starts are kept; the result is only sorted.
+    skipped. Exact duplicate rows are collapsed to one; when two rows
+    share the same ``stepStart`` but differ in end or price, the first
+    occurrence in API order is kept and the conflict is logged.
     Raises ValueError when no usable tier remains.
     """
     clean: list[RateTier] = []
+    seen_starts: dict[float, RateTier] = {}
     for rate in raw_rates or []:
         if not isinstance(rate, dict):
             continue
@@ -59,7 +65,21 @@ def normalize_rates(raw_rates: list[dict[str, Any]]) -> list[RateTier]:
             continue
         if end is not None and (not math.isfinite(end) or end <= start):
             continue
-        clean.append((start, end, price))
+        tier: RateTier = (start, end, price)
+        prev = seen_starts.get(start)
+        if prev is not None:
+            if prev == tier:
+                continue
+            _LOGGER.warning(
+                "Conflicting duplicate tariff tier for stepStart %r; "
+                "keeping first occurrence %r and discarding %r",
+                start,
+                prev,
+                tier,
+            )
+            continue
+        seen_starts[start] = tier
+        clean.append(tier)
     if not clean:
         raise ValueError("No usable consumption rates")
     clean.sort(key=lambda tier: tier[0])
@@ -116,17 +136,76 @@ def prune_days(days: dict[str, float], keep: int) -> dict[str, float]:
     return dict(sorted(days.items())[-keep:])
 
 
+def _reading_instant_key(start: Any) -> Any:
+    """Return a hashable key identifying the reading instant.
+
+    ISO-8601 strings are parsed to a real instant (aware timestamps are
+    normalized to UTC) so equivalent instants written with different
+    offsets (e.g. ``+09:00`` vs ``Z``) collapse to one slot. A trailing
+    ``Z`` is converted to ``+00:00`` for ``datetime.fromisoformat``.
+    Unparseable strings (and non-string values) fall back to the raw
+    value so prior behavior is preserved.
+    """
+    if isinstance(start, str):
+        text = start
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return start
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(UTC)
+        return parsed
+    return start
+
+
+def _compare_version_strings(cur: str, prev: str) -> int:
+    """Compare dotted version strings numerically.
+
+    Each ``.``-separated component contributes its leading integer
+    (non-numeric suffixes are ignored; components without digits count
+    as 0). Missing trailing components count as 0, so ``"1.0"`` equals
+    ``"1"``. Returns 1/0/-1 for greater/equal/less. Never raises.
+    """
+    try:
+        cur_parts = cur.split(".")
+        prev_parts = prev.split(".")
+        width = max(len(cur_parts), len(prev_parts))
+        for index in range(width):
+            cur_num = 0
+            prev_num = 0
+            if index < len(cur_parts):
+                match = re.match(r"\d+", cur_parts[index].strip())
+                if match:
+                    cur_num = int(match.group(0))
+            if index < len(prev_parts):
+                match = re.match(r"\d+", prev_parts[index].strip())
+                if match:
+                    prev_num = int(match.group(0))
+            if cur_num != prev_num:
+                return 1 if cur_num > prev_num else -1
+        return 0
+    except (ValueError, TypeError, AttributeError):
+        # defensive: never break dedup on odd versions
+        return 0
+
+
 def deduplicate_readings(readings: list[dict]) -> list[dict]:
     """Deduplicate half-hourly readings by ``startAt``.
 
     The Kraken API may return multiple revisions of the same slot
     (same ``startAt``, different ``version``). Each element is expected
     to look like ``{"startAt": str, "value": Any, "version": Any}``.
-    When duplicates share a ``startAt``, the entry with the larger
-    ``version`` wins when versions are comparable; otherwise the later
-    occurrence wins. ``None``/non-dict elements (and dicts without a
-    ``startAt``) are skipped. The result is sorted by ``startAt``
-    ascending.
+    Equivalent instants expressed with different offsets (e.g.
+    ``+09:00`` vs ``Z``) collapse to a single slot. When duplicates
+    share a slot, the entry with the larger ``version`` wins when
+    versions are comparable (dotted numeric strings compare
+    numerically, so ``"10"`` beats ``"9"``); otherwise the later
+    occurrence wins (this includes missing versions, incomparable
+    types, and equal versions). ``None``/non-dict elements (and dicts
+    without a ``startAt``) are skipped. The result is sorted by
+    ``startAt`` ascending.
     """
     best: dict[Any, dict] = {}
     for entry in readings or []:
@@ -135,22 +214,27 @@ def deduplicate_readings(readings: list[dict]) -> list[dict]:
         start = entry.get("startAt")
         if start is None:
             continue
-        prev = best.get(start)
+        key = _reading_instant_key(start)
+        prev = best.get(key)
         if prev is None:
-            best[start] = entry
+            best[key] = entry
             continue
         prev_version = prev.get("version")
         cur_version = entry.get("version")
         if prev_version is None or cur_version is None:
-            # version 無しは後勝ち
-            best[start] = entry
+            # version 無しは後勝ち (last one wins)
+            best[key] = entry
+            continue
+        if isinstance(prev_version, str) and isinstance(cur_version, str):
+            if _compare_version_strings(cur_version, prev_version) >= 0:
+                best[key] = entry
             continue
         try:
             if cur_version >= prev_version:
-                best[start] = entry
+                best[key] = entry
         except TypeError:
-            # 比較不能な型同士は後勝ち
-            best[start] = entry
+            # 比較不能な型同士は後勝ち (last one wins)
+            best[key] = entry
     return [best[key] for key in sorted(best.keys(), key=str)]
 
 

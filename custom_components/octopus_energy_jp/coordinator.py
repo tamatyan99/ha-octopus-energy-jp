@@ -268,7 +268,17 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         # API保持期間より古い日付はストアの値で補完し、最新値で更新して永続化
-        self._stored_days.update(daily_kwh)
+        if daily_kwh:
+            oldest_returned = min(daily_kwh)
+            for day, kwh in daily_kwh.items():
+                prev = self._stored_days.get(day)
+                # The oldest day the API returns sits on the rolling-retention
+                # boundary and can be a partial day; never let it shrink a day we
+                # already stored completely. Other days still accept real
+                # downward corrections from the API.
+                if day == oldest_returned and prev is not None and kwh < prev:
+                    continue
+                self._stored_days[day] = kwh
         self._stored_days = utils.prune_days(self._stored_days, MAX_DAILY_DAYS)
         daily_kwh = dict(self._stored_days)
         try:
@@ -413,4 +423,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "billing_period": billing_period,
             "billing": billing,
             "last_update": now.isoformat(),
+            "today_start": now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat(),
+            "month_start": month_start.isoformat(),
         }

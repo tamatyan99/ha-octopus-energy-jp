@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -17,6 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_ACCOUNT_NUMBER, DOMAIN, MAX_DAILY_ATTRIBUTE_DAYS
 from .coordinator import OctopusEnergyJpCoordinator
@@ -30,6 +32,7 @@ class OctopusSensorDescription(SensorEntityDescription):
     """Sensor description with a value accessor."""
 
     value_fn: Callable[[dict[str, Any]], Any]
+    last_reset_fn: Callable[[dict[str, Any]], datetime | None] | None = None
 
 
 SENSORS: tuple[OctopusSensorDescription, ...] = (
@@ -38,7 +41,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="usage",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=1,
         value_fn=lambda d: d["yesterday_kwh"],
     ),
@@ -47,7 +50,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="yesterday_kwh",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=1,
         value_fn=lambda d: d["yesterday_kwh"],
     ),
@@ -59,6 +62,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_fn=lambda d: d["today_kwh"],
+        last_reset_fn=lambda d: d.get("today_start"),
     ),
     OctopusSensorDescription(
         key="month_kwh",
@@ -68,6 +72,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_fn=lambda d: d["month_kwh"],
+        last_reset_fn=lambda d: d.get("month_start"),
     ),
     OctopusSensorDescription(
         key="diff_kwh",
@@ -82,7 +87,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="prev_month_kwh",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=1,
         value_fn=lambda d: d["prev_month_kwh"],
     ),
@@ -99,7 +104,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="cost_yesterday",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_yesterday"],
     ),
@@ -111,6 +116,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_today"],
+        last_reset_fn=lambda d: d.get("today_start"),
     ),
     OctopusSensorDescription(
         key="cost_month",
@@ -120,13 +126,14 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
         value_fn=lambda d: d["cost_month"],
+        last_reset_fn=lambda d: d.get("month_start"),
     ),
     OctopusSensorDescription(
         key="prev_month_cost",
         translation_key="prev_month_cost",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=0,
         value_fn=lambda d: d["prev_month_cost"],
     ),
@@ -135,7 +142,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="billing_kwh",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement="kWh",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=1,
         value_fn=lambda d: (d.get("billing") or {}).get("kwh"),
     ),
@@ -144,7 +151,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         translation_key="billing_cost",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="JPY",
-        state_class=SensorStateClass.TOTAL,
+        state_class=None,
         suggested_display_precision=0,
         value_fn=lambda d: (d.get("billing") or {}).get("total"),
     ),
@@ -195,6 +202,27 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
             return self.entity_description.value_fn(self.coordinator.data)
         except (KeyError, TypeError):
             return None
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return the period start for running-total sensors."""
+        fn = self.entity_description.last_reset_fn
+        if fn is None:
+            return None
+        try:
+            value = fn(self.coordinator.data)
+        except (KeyError, TypeError, AttributeError):
+            return None
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return dt_util.parse_datetime(value)
+            except (ValueError, TypeError):
+                return None
+        return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

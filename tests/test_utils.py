@@ -553,3 +553,89 @@ def test_coerce_option_float_int_blank_and_containers() -> None:
     assert utils.coerce_option_float(" 12.5 ") == 12.5
     assert utils.coerce_option_float([1]) == 0.0
     assert utils.coerce_option_float({"a": 1}) == 0.0
+
+
+def test_normalize_rates_collapses_exact_duplicates() -> None:
+    raw = [
+        {"stepStart": 0, "stepEnd": 120, "pricePerUnitIncTax": 30},
+        {"stepStart": 0, "stepEnd": 120, "pricePerUnitIncTax": 30},
+        {"stepStart": 120, "stepEnd": None, "pricePerUnitIncTax": 35.5},
+    ]
+    assert utils.normalize_rates(raw) == [(0.0, 120.0, 30.0), (120.0, None, 35.5)]
+
+
+def test_normalize_rates_conflicting_start_keeps_first(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = [
+        {"stepStart": 0, "stepEnd": None, "pricePerUnitIncTax": 10},
+        {"stepStart": 0, "stepEnd": 120, "pricePerUnitIncTax": 20},
+    ]
+    with caplog.at_level("WARNING", logger="oejp_utils"):
+        normalized = utils.normalize_rates(raw)
+    assert normalized == [(0.0, None, 10.0)]
+    assert any("0.0" in record.message for record in caplog.records)
+    # no longer double-charges: was 3900.0 (150*10 + 120*20) before the fix
+    assert utils.tiered_cost(150, normalized) == pytest.approx(1500.0)
+
+
+def test_tiered_cost_normal_multi_tier_ladder() -> None:
+    rates = [(0.0, 120.0, 30.0), (120.0, 300.0, 35.0), (300.0, None, 40.0)]
+    assert utils.tiered_cost(150, rates) == pytest.approx(3600.0 + 30 * 35.0)
+    assert utils.tiered_cost(350, rates) == pytest.approx(
+        3600.0 + 180 * 35.0 + 50 * 40.0
+    )
+
+
+def test_deduplicate_readings_collapses_equivalent_instants() -> None:
+    readings = [
+        {"startAt": "2026-07-01T00:30:00+09:00", "value": 1.0, "version": 1},
+        {"startAt": "2026-06-30T15:30:00Z", "value": 2.0, "version": 2},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 1
+    assert result[0]["value"] == 2.0
+
+
+def test_deduplicate_readings_unparseable_start_behaves_as_before() -> None:
+    readings = [
+        {"startAt": "not-a-timestamp", "value": 1, "version": 1},
+        {"startAt": "not-a-timestamp", "value": 2, "version": 2},
+        {"startAt": "also-bad", "value": 3, "version": 1},
+    ]
+    result = utils.deduplicate_readings(readings)
+    assert len(result) == 2
+    by_start = {r["startAt"]: r for r in result}
+    assert by_start["not-a-timestamp"]["value"] == 2
+    assert by_start["also-bad"]["value"] == 3
+
+
+def test_deduplicate_readings_numeric_string_versions_compare_numerically() -> None:
+    assert (
+        utils.deduplicate_readings(
+            [
+                {"startAt": "t", "value": 1, "version": "9"},
+                {"startAt": "t", "value": 2, "version": "10"},
+            ]
+        )[0]["value"]
+        == 2
+    )
+    assert (
+        utils.deduplicate_readings(
+            [
+                {"startAt": "t", "value": 1, "version": "1.9"},
+                {"startAt": "t", "value": 2, "version": "1.10"},
+            ]
+        )[0]["value"]
+        == 2
+    )
+    # equal versions keep later-wins tie-breaking
+    assert (
+        utils.deduplicate_readings(
+            [
+                {"startAt": "t", "value": 1, "version": "1.10"},
+                {"startAt": "t", "value": 2, "version": "1.10"},
+            ]
+        )[0]["value"]
+        == 2
+    )

@@ -25,13 +25,16 @@ Energy Dashboard 用の外部統計を提供します。
 
 ## 前提と制限 / Requirements & Limitations
 
-- Home Assistant 2024.11 以降が必要です（Requires HA 2024.11+）。
+- Home Assistant 2025.4 以降が必要です（Requires HA 2025.4+。開発・動作確認は 2026.9 系）。
 - `recorder` が必須です。無効化していると履歴・統計が記録されません。
+- データ更新間隔は1時間です（Data refreshes hourly）。30分値は約8時間遅れで届きます。
 - 段階制料金プラン（グリーンオクトパス等）に対応。従量単価は Kraken API の料金表から取得します。
 - 複数契約がある場合、最初の供給地点のみ使用します（Only the first supply point is used）。
 - 不具合・要望は [Issues](https://github.com/tamatyan99/ha-octopus-energy-jp/issues) までお願いします。
 
 ## インストール
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=tamatyan99&repository=ha-octopus-energy-jp&category=integration)
 
 ### HACS（カスタムリポジトリ）
 
@@ -44,6 +47,14 @@ Energy Dashboard 用の外部統計を提供します。
 
 1. `custom_components/octopus_energy_jp/` を Home Assistant の `config/custom_components/` 配下にコピー
 2. Home Assistant を再起動
+
+### アンインストール / Removal
+
+1. **設定 → デバイスとサービス → Octopus Energy Japan → ⋮ → 削除** で統合エントリを削除します
+   （統合が保存していた日次履歴・統計の永続データも同時に削除されます）。
+2. HACS から入れた場合は HACS → 連携 → **Octopus Energy Japan** → ⋮ → **削除** でファイルを削除します。
+3. Energy Dashboard の消費量に登録していた場合は、**設定 → ダッシュボード → エネルギー** から該当ソースを削除します。
+4. 手動で入れた場合は `config/custom_components/octopus_energy_jp/` を削除して Home Assistant を再起動します。
 
 ## 設定
 
@@ -97,6 +108,18 @@ Energy Dashboard 用の外部統計を提供します。
 > [!NOTE]
 > 確定済みの30分枠のみ統計に投入します（暫定の当日値は除外）。
 > そのため当日分は翌日以降に反映されます。
+
+> [!IMPORTANT]
+> v0.2.0 で外部統計の statistic_id が `octopus_energy_jp:consumption` から契約別の
+> `octopus_energy_jp:<供給地点ID>_consumption` に変更されました。v0.1 から更新した場合は
+> Energy Dashboard の消費量ソースを選び直してください（旧統計は履歴として残ります）。
+
+> [!WARNING]
+> 消費量には**外部統計（`Octopus Energy Japan consumption`）だけ**を選んでください。
+> `today_kwh` / `month_kwh` / `cost_today` / `cost_month` も統計を持ちますが、
+> 外部統計と併せて選ぶと**二重計上**になります。
+> `yesterday_kwh` / `prev_month_*` / `billing_*` / `cost_yesterday` / `prev_month_cost` は
+> 確定済み期間のスナップショットのため、長期統計を生成しません（履歴は recorder の通常履歴に残ります）。
 
 ## トラブルシューティング / Troubleshooting
 

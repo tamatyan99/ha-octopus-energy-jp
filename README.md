@@ -166,12 +166,25 @@ logger:
 
 ## 開発
 
+テストは Home Assistant 本体のテストハーネスを使います
+（`pytest-homeassistant-custom-component` が HA 2026.x を固定するため **Python 3.14 以降**が必要）。
+
 ```bash
+python3.14 -m venv .venv && . .venv/bin/activate
+pip install -r requirements_test.txt
+
+ruff check --config pyproject.toml custom_components tests
+ruff format --check --config pyproject.toml custom_components tests
 python -m compileall -q custom_components
-pytest
-hassfest --action validate
-hacs validate
+pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=80
 ```
+
+- `tests/test_utils.py` は HA 非依存のロジックのみを対象にしているため、Home Assistant なしでも実行できます。
+- `tests/test_config_flow.py` / `test_init.py` / `test_sensor.py` / `test_api.py` / `test_coordinator.py` / `test_diagnostics.py` は
+  HA のテストハーネス上で動作し、ネットワークには一切アクセスしません。
+- カバレッジゲートはパッケージ全体で 80%（`statistics.py` は未テストのため）。
+  モジュール別の現状: api 99% / diagnostics 100% / coordinator 96% / sensor 94% / config_flow 91% / utils 98% / statistics 25%。
+- CI（`hassfest` / `hacs` / `test`）で同じ検証が自動実行されます。
 
 ## ライセンス
 

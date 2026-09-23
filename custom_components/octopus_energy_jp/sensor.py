@@ -14,6 +14,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -35,6 +36,9 @@ class OctopusSensorDescription(SensorEntityDescription):
     last_reset_fn: Callable[[dict[str, Any]], datetime | None] | None = None
 
 
+# すべてのセンサーはユーザー向けのためデフォルトで有効のままにする。
+# entity_registry_enabled_default=False は新規インストールで
+# エンティティが消えるため設定しない。
 SENSORS: tuple[OctopusSensorDescription, ...] = (
     OctopusSensorDescription(
         key="yesterday_kwh",
@@ -68,6 +72,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
     OctopusSensorDescription(
         key="diff_kwh",
         translation_key="diff_kwh",
+        entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement="kWh",
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
@@ -85,6 +90,7 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
     OctopusSensorDescription(
         key="month_diff_kwh",
         translation_key="month_diff_kwh",
+        entity_category=EntityCategory.DIAGNOSTIC,
         native_unit_of_measurement="kWh",
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,

@@ -29,4 +29,5 @@ jobs:
       - run: ruff check --config pyproject.toml custom_components tests
       - run: ruff format --check --config pyproject.toml custom_components tests
       - run: python -m compileall -q custom_components
-      - run: python -m pytest tests/ -q --cov=custom_components.octopus_energy_jp.utils --cov-fail-under=90
+      # パッケージ全体のカバレッジゲート (statistics.py は未テストのため 80%)
+      - run: python -m pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=80

@@ -176,14 +176,14 @@ pip install -r requirements_test.txt
 ruff check --config pyproject.toml custom_components tests
 ruff format --check --config pyproject.toml custom_components tests
 python -m compileall -q custom_components
-pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=80
+pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=90
 ```
 
 - `tests/test_utils.py` は HA 非依存のロジックのみを対象にしているため、Home Assistant なしでも実行できます。
 - `tests/test_config_flow.py` / `test_init.py` / `test_sensor.py` / `test_api.py` / `test_coordinator.py` / `test_diagnostics.py` は
   HA のテストハーネス上で動作し、ネットワークには一切アクセスしません。
-- カバレッジゲートはパッケージ全体で 80%（`statistics.py` は未テストのため）。
-  モジュール別の現状: api 99% / diagnostics 100% / coordinator 96% / sensor 94% / config_flow 91% / utils 98% / statistics 25%。
+- カバレッジゲートはパッケージ全体で 90%。
+  モジュール別の現状: diagnostics 100% / api 99% / utils 98% / coordinator 96% / statistics 95% / sensor 94% / config_flow 91%（`__init__.py` は 58%）。
 - CI（`hassfest` / `hacs` / `test`）で同じ検証が自動実行されます。
 
 ## ライセンス

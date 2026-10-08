@@ -146,22 +146,16 @@ async def test_diagnostics_redacts_secrets_masks_title_and_summarizes(hass):
     }
     assert result["coordinator_data"]
 
-    # No raw secret anywhere in the nested payload (unique_id may equal account).
     strings = _collect_strings(result)
     for secret in (EMAIL, PASSWORD, COORD_TOKEN):
         assert all(secret not in text for text in strings), secret
-    account_strings = [
-        text
-        for text in strings
-        if ACCOUNT in text and text != result["entry"]["unique_id"]
-    ]
-    assert not account_strings
+    assert all(ACCOUNT not in text for text in strings)
 
     # Password is not carried at all; email/account stay identifiable-but-safe.
     assert "password" not in result["entry"]["data"]
     assert PASSWORD not in json.dumps(result)
     assert result["entry"]["version"] == entry.version
-    assert result["entry"]["unique_id"] == ACCOUNT
+    assert result["entry"]["unique_id"] == "A-****1234"
     assert result["entry"]["options"] == entry.options
     assert result["entry"]["data"]["email"] == "u***@example.com"
     assert result["entry"]["data"]["account_number"] == "A-****1234"
@@ -206,12 +200,7 @@ async def test_diagnostics_empty_coordinator_data(hass):
     strings = _collect_strings(result)
     for secret in (EMAIL, PASSWORD):
         assert all(secret not in text for text in strings), secret
-    account_strings = [
-        text
-        for text in strings
-        if ACCOUNT in text and text != result["entry"]["unique_id"]
-    ]
-    assert not account_strings
+    assert all(ACCOUNT not in text for text in strings)
     json.dumps(result)
 
 

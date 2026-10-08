@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -85,20 +86,20 @@ def test_get_hourly_and_signature_helpers() -> None:
     assert _get_hourly({"hourly": []}) is None
     hourly = [{"start": "2026-07-14T01:00:00+09:00", "kwh": 1.0}]
     assert _get_hourly({"hourly": hourly}) == hourly
-    assert _hourly_signature(hourly) == (1, "2026-07-14T01:00:00+09:00")
-    assert _hourly_signature([{"start": 42}]) == (1, "42")
+    assert _hourly_signature(hourly) == (1, "2026-07-14T01:00:00+09:00", 1.0, 1.0)
+    assert _hourly_signature([{"start": 42}]) == (1, "42", 0.0, 0.0)
 
     class _Row:
         start = "object-start"
 
-    assert _hourly_signature([_Row()]) == (1, "object-start")
-    assert _hourly_signature(["bad"]) == (1, "bad")
+    assert _hourly_signature([_Row()]) == (1, "object-start", 0.0, 0.0)
+    assert _hourly_signature(["bad"]) == (1, "bad", 0.0, 0.0)
 
     class _UnstrableStart:
         def __str__(self) -> str:
             raise ValueError("no str")
 
-    assert _hourly_signature([{"start": _UnstrableStart()}]) == (1, "")
+    assert _hourly_signature([{"start": _UnstrableStart()}]) == (1, "", 0.0, 0.0)
 
     class _LenAlwaysFails:
         def __getitem__(self, _idx: int) -> dict[str, str]:
@@ -107,7 +108,7 @@ def test_get_hourly_and_signature_helpers() -> None:
         def __len__(self) -> int:
             raise TypeError("no len")
 
-    assert _hourly_signature(_LenAlwaysFails()) == (0, "")
+    assert _hourly_signature(_LenAlwaysFails()) == (0, "", 0.0, 0.0)
 
 
 async def test_async_reload_on_update_requests_entry_reload(hass) -> None:
@@ -178,18 +179,20 @@ async def test_import_task_done_logs_task_exception(hass, caplog) -> None:
     previous = dt_util.DEFAULT_TIME_ZONE
     dt_util.set_default_time_zone(tz)
     caplog.set_level(logging.ERROR)
-    orig_create_task = hass.async_create_task
+    orig_create_bg = hass.async_create_background_task
 
-    def wrap_create_task(coro):
-        inner = orig_create_task(coro)
-        report = MagicMock()
-        report.exception.return_value = RuntimeError("background import failed")
+    def wrap_create_background_task(coro, name, eager_start=True):
+        inner = orig_create_bg(coro, name, eager_start)
+        orig_add_done = inner.add_done_callback
 
         def add_done_callback(callback):
-            inner.add_done_callback(lambda _t: callback(report))
+            report = MagicMock()
+            report.cancelled.return_value = False
+            report.exception.return_value = RuntimeError("background import failed")
+            orig_add_done(lambda _task: callback(report))
 
-        report.add_done_callback = add_done_callback
-        return report
+        inner.add_done_callback = add_done_callback
+        return inner
 
     try:
         with (
@@ -199,7 +202,11 @@ async def test_import_task_done_logs_task_exception(hass, caplog) -> None:
             patch(
                 "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
             ),
-            patch.object(hass, "async_create_task", side_effect=wrap_create_task),
+            patch.object(
+                hass,
+                "async_create_background_task",
+                side_effect=wrap_create_background_task,
+            ),
         ):
             assert await hass.config_entries.async_setup(entry.entry_id)
             await hass.async_block_till_done()
@@ -235,18 +242,20 @@ async def test_import_task_done_logs_when_exception_lookup_fails(hass, caplog) -
     previous = dt_util.DEFAULT_TIME_ZONE
     dt_util.set_default_time_zone(tz)
     caplog.set_level(logging.ERROR)
-    orig_create_task = hass.async_create_task
+    orig_create_bg = hass.async_create_background_task
 
-    def wrap_create_task(coro):
-        inner = orig_create_task(coro)
-        report = MagicMock()
-        report.exception.side_effect = RuntimeError("task state unavailable")
+    def wrap_create_background_task(coro, name, eager_start=True):
+        inner = orig_create_bg(coro, name, eager_start)
+        orig_add_done = inner.add_done_callback
 
         def add_done_callback(callback):
-            inner.add_done_callback(lambda _t: callback(report))
+            report = MagicMock()
+            report.cancelled.return_value = False
+            report.exception.side_effect = RuntimeError("task state unavailable")
+            orig_add_done(lambda _task: callback(report))
 
-        report.add_done_callback = add_done_callback
-        return report
+        inner.add_done_callback = add_done_callback
+        return inner
 
     try:
         with (
@@ -256,7 +265,11 @@ async def test_import_task_done_logs_when_exception_lookup_fails(hass, caplog) -
             patch(
                 "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
             ),
-            patch.object(hass, "async_create_task", side_effect=wrap_create_task),
+            patch.object(
+                hass,
+                "async_create_background_task",
+                side_effect=wrap_create_background_task,
+            ),
         ):
             assert await hass.config_entries.async_setup(entry.entry_id)
             await hass.async_block_till_done()
@@ -324,6 +337,101 @@ async def test_coordinator_update_imports_both_and_skips_unchanged_signature(has
             coordinator.async_update_listeners()
             await hass.async_block_till_done()
             assert mock_add.call_count == 4
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+
+async def test_coordinator_update_imports_when_same_length_hourly_values_change(hass):
+    """A corrected kWh for an existing hour must re-trigger import."""
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ) as mock_add,
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+            assert mock_add.call_count == 2
+
+            corrected = {
+                "hourly": [
+                    dict(payload["hourly"][0]),
+                    {**payload["hourly"][1], "kwh": 0.99, "cost": 99.0},
+                ]
+            }
+            coordinator = entry.runtime_data["coordinator"]
+            coordinator.data = corrected
+            coordinator.async_update_listeners()
+            await hass.async_block_till_done()
+            assert mock_add.call_count == 4
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+
+async def test_unload_cancels_in_flight_statistics_import(hass):
+    """Background import tasks are cancelled on config entry unload."""
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    import_started = asyncio.Event()
+    import_completed = False
+
+    async def blocking_import(_hourly_data):
+        import_started.set()
+        nonlocal import_completed
+        await asyncio.Event().wait()
+        import_completed = True
+
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+            runtime = entry.runtime_data
+            runtime["importer"].async_import = AsyncMock(side_effect=blocking_import)
+            runtime["cost_importer"].async_import = AsyncMock(
+                side_effect=blocking_import
+            )
+
+            extended = {
+                "hourly": payload["hourly"]
+                + [
+                    {
+                        "start": payload["hourly"][-1]["start"] + timedelta(hours=1),
+                        "kwh": 0.7,
+                        "cost": 20.0,
+                    }
+                ]
+            }
+            runtime["coordinator"].data = extended
+            runtime["coordinator"].async_update_listeners()
+            await import_started.wait()
+
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            await hass.async_block_till_done()
+
+            assert import_completed is False
     finally:
         dt_util.set_default_time_zone(previous)
 
@@ -494,3 +602,33 @@ async def test_async_remove_entry_removes_all_stores_and_tolerates_failures(hass
         f"{DOMAIN}_{entry.entry_id}_statistics_cost",
     }
     assert set(removed) == expected
+
+
+async def test_async_remove_entry_clears_recorder_statistics(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    mock_instance = MagicMock()
+    with patch(
+        "custom_components.octopus_energy_jp.get_instance",
+        return_value=mock_instance,
+    ):
+        await async_remove_entry(hass, entry)
+
+    mock_instance.async_clear_statistics.assert_called_once_with(
+        [
+            "octopus_energy_jp:a_test1234_consumption",
+            "octopus_energy_jp:a_test1234_cost",
+        ]
+    )
+
+
+async def test_async_remove_entry_swallows_recorder_clear_failure(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    mock_instance = MagicMock()
+    mock_instance.async_clear_statistics.side_effect = RuntimeError("recorder down")
+    with patch(
+        "custom_components.octopus_energy_jp.get_instance",
+        return_value=mock_instance,
+    ):
+        await async_remove_entry(hass, entry)

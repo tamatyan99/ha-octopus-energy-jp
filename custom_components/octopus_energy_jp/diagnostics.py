@@ -111,7 +111,7 @@ async def async_get_config_entry_diagnostics(
             "title": _mask_account_number(entry.title),
             "data": redacted_entry,
             "version": entry.version,
-            "unique_id": entry.unique_id,
+            "unique_id": _mask_account_number(entry.unique_id),
             "options": {
                 CONF_BASIC_CHARGE_PER_DAY: entry.options.get(CONF_BASIC_CHARGE_PER_DAY),
                 CONF_FUEL_ADJUSTMENT_PER_KWH: entry.options.get(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
@@ -13,9 +14,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 
 from .api import OctopusEnergyJpApiClient
-from .const import DOMAIN, STORAGE_VERSION
+from .const import CONF_ACCOUNT_NUMBER, DOMAIN, STORAGE_VERSION
 from .coordinator import OctopusEnergyJpCoordinator
 from .statistics import OctopusStatisticsImporter
+from .utils import cost_statistic_id_for_account, statistic_id_for_account
 
 PLATFORMS = [Platform.SENSOR]
 
@@ -32,20 +34,32 @@ def _get_hourly(data: Any) -> list | None:
     return hourly
 
 
+def _kwh_from_hourly_row(row: Any) -> float:
+    """hourly 行から kWh を安全に取り出す（シグネチャ用、I/O なし）。"""
+    try:
+        if isinstance(row, dict):
+            return float(row.get("kwh") or 0)
+        return float(getattr(row, "kwh", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _hourly_signature(hourly: list) -> tuple:
-    """hourly の簡易シグネチャ（件数 + 最終start）を返す。"""
+    """hourly の簡易シグネチャ（件数 + 最終start + 値ダイジェスト）を返す。"""
     try:
         last = hourly[-1] if hourly else None
         if isinstance(last, dict):
             last_start = last.get("start")
         else:
             last_start = getattr(last, "start", last)
-        return (len(hourly), str(last_start))
+        total_kwh = round(sum(_kwh_from_hourly_row(row) for row in hourly), 4)
+        last_kwh = round(_kwh_from_hourly_row(last) if last is not None else 0.0, 4)
+        return (len(hourly), str(last_start), total_kwh, last_kwh)
     except Exception:  # noqa: BLE001 - シグネチャ計算の失敗ではimportを止めない
         try:
-            return (len(hourly), "")
+            return (len(hourly), "", 0.0, 0.0)
         except Exception:  # noqa: BLE001
-            return (0, "")
+            return (0, "", 0.0, 0.0)
 
 
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -107,6 +121,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     def _log_task_done(task) -> None:
         """fire-and-forget タスクの例外をログに出す。"""
+        if task.cancelled():
+            return
         try:
             exc = task.exception()
         except Exception:
@@ -125,7 +141,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if signature == last_signature:
             return
         last_signature = signature
-        task = hass.async_create_task(_safe_import(hourly_data))
+        task = entry.async_create_background_task(
+            hass, _safe_import(hourly_data), name="octopus_energy_jp import"
+        )
         task.add_done_callback(_log_task_done)
 
     entry.async_on_unload(coordinator.async_add_listener(_import_on_update))
@@ -155,3 +173,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             await Store(hass, STORAGE_VERSION, key).async_remove()
         except Exception as err:  # noqa: BLE001 - missing store must not fail
             _LOGGER.debug("Failed to remove store %s: %s", key, err)
+
+    account = entry.unique_id or entry.data.get(CONF_ACCOUNT_NUMBER)
+    if account:
+        statistic_ids = [
+            statistic_id_for_account(DOMAIN, account),
+            cost_statistic_id_for_account(DOMAIN, account),
+        ]
+        try:
+            get_instance(hass).async_clear_statistics(statistic_ids)
+        except Exception as err:  # noqa: BLE001 - recorder absent/disabled must not fail
+            _LOGGER.debug("Failed to clear recorder statistics: %s", err)

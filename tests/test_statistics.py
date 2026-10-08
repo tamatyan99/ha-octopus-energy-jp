@@ -680,13 +680,9 @@ async def test_async_import_window_advance_no_false_revision_reimport(
     """Advanced fetch window (prefix dropped) must not trigger revision re-import."""
     importer = _new_importer(hass, "import-window-advance")
     base1 = _sep_jst(1, 0)
-    hourly1 = [
-        {"start": base1 + timedelta(hours=i), "kwh": 1.0} for i in range(72)
-    ]
+    hourly1 = [{"start": base1 + timedelta(hours=i), "kwh": 1.0} for i in range(72)]
     base2 = _sep_jst(2, 0)
-    hourly2 = [
-        {"start": base2 + timedelta(hours=i), "kwh": 1.0} for i in range(72)
-    ]
+    hourly2 = [{"start": base2 + timedelta(hours=i), "kwh": 1.0} for i in range(72)]
     with (
         _frozen_september_jst(),
         patch(

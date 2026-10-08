@@ -747,10 +747,9 @@ def test_month_prior_index_matches_naive_sum_across_month_boundary() -> None:
         cum_before = _month_prior_daily_kwh(daily, month_key, day_str) + same_day.get(
             day_str, 0.0
         )
-        energy = (
-            oejp_utils.tiered_cost(cum_before + kwh, TIERED_RATES)
-            - oejp_utils.tiered_cost(cum_before, TIERED_RATES)
-        )
+        energy = oejp_utils.tiered_cost(
+            cum_before + kwh, TIERED_RATES
+        ) - oejp_utils.tiered_cost(cum_before, TIERED_RATES)
         cost = round(energy + (fuel + levy) * kwh, 3)
         same_day[day_str] = same_day.get(day_str, 0.0) + kwh
         reference.append({"start": item["start"], "kwh": kwh, "cost": cost})

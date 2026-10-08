@@ -229,7 +229,7 @@ pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=90
 - `tests/test_config_flow.py` / `test_init.py` / `test_sensor.py` / `test_api.py` / `test_coordinator.py` / `test_diagnostics.py` は
   HA のテストハーネス上で動作し、ネットワークには一切アクセスしません。
 - カバレッジゲートはパッケージ全体で 90%。
-  モジュール別の現状: diagnostics 100% / api 99% / utils 98% / coordinator 96% / statistics 95% / sensor 94% / config_flow 91%（`__init__.py` は 58%）。
+  モジュール別の現状: diagnostics 100% / utils 100% / api 99% / `__init__.py` 98% / statistics 97% / coordinator 97% / sensor 95% / config_flow 93%。
 - CI（`hassfest` / `hacs` / `test`）で同じ検証が自動実行されます。
 
 ## ライセンス

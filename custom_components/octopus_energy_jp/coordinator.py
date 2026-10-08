@@ -134,6 +134,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._static_fetched_at: datetime | None = None
         self._contract: dict[str, Any] | None = None
         self._rates: list[utils.RateTier] | None = None
+        # 契約から取得した基本料金・燃料費調整額・再エネ賦課金 (オプション未設定時に使用)
+        self._surcharges: dict[str, float | None] = {}
         # API の保持期間（約1か月）を補う日次履歴の永続ストア
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}_{entry.entry_id}_daily"
@@ -177,6 +179,13 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if corrupt:
             _LOGGER.warning("Ignoring corrupt daily entries, keeping valid ones")
         self._stored_days = cleaned
+
+    def _resolve_surcharge(self, option_key: str, api_key: str) -> float:
+        """Prefer an explicitly set option; otherwise fall back to the API value."""
+        options = self._entry.options
+        if options.get(option_key) is not None:
+            return utils.coerce_option_float(options.get(option_key))
+        return utils.coerce_option_float(self._surcharges.get(api_key))
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -225,6 +234,16 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._contract = contract
                 self._rates = normalized_rates
                 self._static_fetched_at = now
+                try:
+                    self._surcharges = await self.api.async_get_surcharges(
+                        self.account_number
+                    )
+                except OctopusAuthError:
+                    raise
+                except Exception as err:  # noqa: BLE001 - surcharges are optional
+                    _LOGGER.warning(
+                        "Surcharge fetch failed, keeping previous values: %s", err
+                    )
 
         if self._contract is None or self._rates is None:
             raise OctopusApiError("Contract or tariff rates unavailable")
@@ -417,6 +436,16 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             latest_bill = None
 
+        basic_per_day = self._resolve_surcharge(
+            CONF_BASIC_CHARGE_PER_DAY, "standing_charge_per_day"
+        )
+        fuel_per_kwh = self._resolve_surcharge(
+            CONF_FUEL_ADJUSTMENT_PER_KWH, "fuel_per_kwh"
+        )
+        levy_per_kwh = self._resolve_surcharge(
+            CONF_RENEWABLE_LEVY_PER_KWH, "levy_per_kwh"
+        )
+
         billing_period: dict[str, Any] | None = None
         billing: dict[str, Any] | None = None
         if latest_bill is not None:
@@ -429,27 +458,17 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "bill_type": latest_bill.get("bill_type"),
                     "source": "bill",
                 }
-                options = self._entry.options
                 billing = utils.compute_billing(
                     daily_kwh,
                     rates,
                     from_day,
                     to_day,
                     "bill",
-                    utils.coerce_option_float(options.get(CONF_BASIC_CHARGE_PER_DAY)),
-                    utils.coerce_option_float(
-                        options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)
-                    ),
-                    utils.coerce_option_float(options.get(CONF_RENEWABLE_LEVY_PER_KWH)),
+                    basic_per_day,
+                    fuel_per_kwh,
+                    levy_per_kwh,
                 )
 
-        options = self._entry.options
-        fuel_per_kwh = utils.coerce_option_float(
-            options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)
-        )
-        levy_per_kwh = utils.coerce_option_float(
-            options.get(CONF_RENEWABLE_LEVY_PER_KWH)
-        )
         hourly_base = [
             {"start": start, "kwh": kwh} for start, kwh in sorted(hourly_kwh.items())
         ]

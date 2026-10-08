@@ -134,6 +134,7 @@ def _make_coordinator(
     contract: dict[str, Any] | None = None,
     bill: dict[str, Any] | None = None,
     bill_error: Exception | None = None,
+    surcharges: dict[str, float | None] | None = None,
 ) -> OctopusEnergyJpCoordinator:
     """Build a coordinator backed by a fake API client (no network)."""
     api = MagicMock()
@@ -143,6 +144,7 @@ def _make_coordinator(
     api.async_get_tariff_rates = AsyncMock(
         return_value=[dict(t) for t in TARIFF_DICTS] if tariff is None else tariff
     )
+    api.async_get_surcharges = AsyncMock(return_value=dict(surcharges or {}))
     payload = [dict(r) if isinstance(r, dict) else r for r in readings]
 
     async def _readings(
@@ -404,6 +406,93 @@ async def test_billing_without_options_is_energy_only(hass: HomeAssistant) -> No
     assert "basic_charge" not in data["billing"]
     assert "fuel_adjustment" not in data["billing"]
     assert "renewable_levy" not in data["billing"]
+
+
+API_SURCHARGES = {
+    "standing_charge_per_day": 40.0,
+    "fuel_per_kwh": 2.0,
+    "levy_per_kwh": 3.0,
+}
+
+
+async def test_billing_uses_api_surcharges_when_options_unset(
+    hass: HomeAssistant,
+) -> None:
+    coord = _make_coordinator(
+        hass,
+        _new_entry(),
+        _half_hourly(_fixed_days()),
+        bill=_bill(),
+        surcharges=dict(API_SURCHARGES),
+    )
+    with _frozen_jst():
+        data = await coord._async_update_data()
+    assert data["billing"]["basic_charge"] == 400
+    assert data["billing"]["fuel_adjustment"] == 110
+    assert data["billing"]["renewable_levy"] == 165
+    assert data["billing"]["total"] == 2325
+    assert data["current_rate_fuel_per_kwh"] == 2.0
+    assert data["current_rate_levy_per_kwh"] == 3.0
+    assert data["current_rate_kwh"] == 41.0
+
+
+async def test_options_override_api_surcharges(hass: HomeAssistant) -> None:
+    coord = _make_coordinator(
+        hass,
+        _new_entry({CONF_FUEL_ADJUSTMENT_PER_KWH: 0.0}),
+        _half_hourly(_fixed_days()),
+        bill=_bill(),
+        surcharges=dict(API_SURCHARGES),
+    )
+    with _frozen_jst():
+        data = await coord._async_update_data()
+    # Explicit 0.0 option wins over the API's 2.0; the others fall back to API.
+    assert data["current_rate_fuel_per_kwh"] == 0.0
+    assert data["current_rate_levy_per_kwh"] == 3.0
+    assert data["billing"]["basic_charge"] == 400
+    assert data["billing"]["renewable_levy"] == 165
+    assert "fuel_adjustment" not in data["billing"]
+
+
+async def test_api_surcharges_match_equivalent_options_for_hourly_cost(
+    hass: HomeAssistant,
+) -> None:
+    readings = _half_hourly(_fixed_days())
+    coord_api = _make_coordinator(
+        hass, _new_entry(), readings, surcharges=dict(API_SURCHARGES)
+    )
+    coord_opts = _make_coordinator(hass, _new_entry(dict(SURCHARGE_OPTIONS)), readings)
+    with _frozen_jst():
+        from_api = await coord_api._async_update_data()
+        from_opts = await coord_opts._async_update_data()
+    assert from_api["hourly"] == from_opts["hourly"]
+
+
+async def test_surcharge_fetch_failure_keeps_previous_values(
+    hass: HomeAssistant,
+) -> None:
+    coord = _make_coordinator(
+        hass, _new_entry(), _half_hourly(_fixed_days()), surcharges=dict(API_SURCHARGES)
+    )
+    with _frozen_jst():
+        await coord._async_update_data()
+    coord.api.async_get_surcharges = AsyncMock(side_effect=OctopusApiError("boom"))
+    coord._static_fetched_at = None
+    with _frozen_jst():
+        data = await coord._async_update_data()
+    assert data["current_rate_fuel_per_kwh"] == 2.0
+    assert data["current_rate_levy_per_kwh"] == 3.0
+
+
+async def test_surcharge_auth_error_becomes_config_entry_auth_failed(
+    hass: HomeAssistant,
+) -> None:
+    coord = _make_coordinator(hass, _new_entry(), [])
+    coord.api.async_get_surcharges = AsyncMock(
+        side_effect=OctopusAuthError("token expired")
+    )
+    with pytest.raises(ConfigEntryAuthFailed):
+        await coord._async_update_data()
 
 
 async def test_billing_with_iso_datetime_bill_dates(hass: HomeAssistant) -> None:

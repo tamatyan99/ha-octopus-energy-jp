@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -199,6 +200,40 @@ query tariff($gridOperatorCode: String!, $productCode: String) {
 }
 """
 
+# 契約(agreement)の商品から基本料金・燃料費調整額・再エネ賦課金を取得する。
+# product は union 型 (段階制 / 単一単価 / FIT)。FIT には料金項目がない。
+SURCHARGE_FIELDS = """
+  standingChargePricePerDay
+  fuelCostAdjustment { pricePerUnitIncTax validFrom validTo }
+  renewableEnergyLevy { pricePerUnitIncTax validFrom validTo }
+"""
+
+SURCHARGES_QUERY = (
+    """
+query surcharges($accountNumber: String!) {
+  account(accountNumber: $accountNumber) {
+    properties {
+      electricitySupplyPoints {
+        agreements {
+          validFrom
+          validTo
+          product {
+            __typename
+            ... on ElectricitySteppedProduct {"""
+    + SURCHARGE_FIELDS
+    + """}
+            ... on ElectricitySingleStepProduct {"""
+    + SURCHARGE_FIELDS
+    + """}
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
 BILLS_QUERY = """
 query bills($accountNumber: String!) {
   account(accountNumber: $accountNumber) {
@@ -219,6 +254,56 @@ query bills($accountNumber: String!) {
   }
 }
 """
+
+
+def _parse_api_datetime(value: Any) -> datetime | None:
+    """Parse a Kraken DateTime/Date string; naive values are treated as UTC."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _is_active(item: dict[str, Any], now: datetime) -> bool:
+    """Return True when validFrom <= now < validTo (missing bounds are open)."""
+    valid_from = _parse_api_datetime(item.get("validFrom"))
+    valid_to = _parse_api_datetime(item.get("validTo"))
+    if valid_from is not None and valid_from > now:
+        return False
+    return valid_to is None or valid_to > now
+
+
+def _pick_active(items: Any, now: datetime) -> dict[str, Any] | None:
+    """Pick the currently valid entry from a dict or list of dicts."""
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return None
+    candidates = [item for item in items if isinstance(item, dict)]
+    for item in candidates:
+        if _is_active(item, now):
+            return item
+    # 期間外しかない場合は validTo 無しの最新を優先し、無ければ末尾
+    for item in reversed(candidates):
+        if item.get("validTo") is None:
+            return item
+    return candidates[-1] if candidates else None
+
+
+def _price(item: dict[str, Any] | None) -> float | None:
+    """Return pricePerUnitIncTax as float, or None when missing/invalid."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        num = float(item.get("pricePerUnitIncTax"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
 
 
 class OctopusApiError(Exception):
@@ -489,6 +574,39 @@ class OctopusEnergyJpApiClient:
             return select_latest_bill(account.get("bills"))
         except (TypeError, AttributeError):
             return None
+
+    async def async_get_surcharges(
+        self, account_number: str, now: datetime | None = None
+    ) -> dict[str, float | None]:
+        """Return the active agreement's standing charge and per-kWh surcharges.
+
+        Keys: ``standing_charge_per_day`` (JPY/day), ``fuel_per_kwh`` and
+        ``levy_per_kwh`` (JPY/kWh, tax included). A value is None when the
+        API does not provide it (e.g. FIT products).
+        """
+        data = await self._async_query(
+            SURCHARGES_QUERY, {"accountNumber": account_number}
+        )
+        account = data.get("account")
+        if not isinstance(account, dict):
+            raise OctopusApiError("Unexpected surcharges response structure")
+        supply_point = self._first_supply_point(account, "surcharges")
+        now = now or datetime.now(timezone.utc)
+        agreement = _pick_active(supply_point.get("agreements"), now)
+        product = agreement.get("product") if isinstance(agreement, dict) else None
+        if not isinstance(product, dict):
+            raise OctopusApiError("No active agreement product found")
+        try:
+            standing = float(product.get("standingChargePricePerDay"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            standing = None
+        return {
+            "standing_charge_per_day": standing
+            if standing is not None and math.isfinite(standing)
+            else None,
+            "fuel_per_kwh": _price(_pick_active(product.get("fuelCostAdjustment"), now)),
+            "levy_per_kwh": _price(_pick_active(product.get("renewableEnergyLevy"), now)),
+        }
 
     async def async_get_tariff_rates(
         self, grid_operator_code: str, product_code: str, capacity_unit: str

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
@@ -15,6 +16,8 @@ from custom_components.octopus_energy_jp.api import (
     OctopusEnergyJpApiClient,
     _has_auth_error_code,
     _is_auth_error,
+    _parse_api_datetime,
+    _pick_active,
 )
 
 EMAIL = "user@example.com"
@@ -743,6 +746,133 @@ async def test_get_readings_rejects_bad_payloads(data: dict) -> None:
         await client.async_get_readings(
             "A-1", datetime(2024, 5, 1), datetime(2024, 5, 2)
         )
+
+
+NOW = datetime(2026, 10, 8, 3, 0, tzinfo=timezone.utc)
+
+
+def _surcharges_payload(agreements: list) -> dict:
+    return {
+        "account": {
+            "properties": [{"electricitySupplyPoints": [{"agreements": agreements}]}]
+        }
+    }
+
+
+def _stepped_product(fuel: Any, levy: Any, standing: Any = "0.00") -> dict:
+    return {
+        "__typename": "ElectricitySteppedProduct",
+        "standingChargePricePerDay": standing,
+        "fuelCostAdjustment": fuel,
+        "renewableEnergyLevy": levy,
+    }
+
+
+async def test_get_surcharges_picks_active_agreement_and_rates() -> None:
+    agreements = [
+        {
+            "validFrom": "2025-01-01T00:00:00+09:00",
+            "validTo": "2026-01-01T00:00:00+09:00",
+            "product": _stepped_product(
+                {"pricePerUnitIncTax": "9.99"}, {"pricePerUnitIncTax": "9.99"}
+            ),
+        },
+        {
+            "validFrom": "2026-01-01T00:00:00+09:00",
+            "validTo": None,
+            "product": _stepped_product(
+                [
+                    {
+                        "pricePerUnitIncTax": "-1.50",
+                        "validFrom": "2026-09-01T00:00:00+09:00",
+                        "validTo": "2026-10-01T00:00:00+09:00",
+                    },
+                    {
+                        "pricePerUnitIncTax": "-1.20",
+                        "validFrom": "2026-10-01T00:00:00+09:00",
+                        "validTo": "2026-11-01T00:00:00+09:00",
+                    },
+                ],
+                {"pricePerUnitIncTax": "4.18", "validFrom": "2026-05-01"},
+                standing="295.24",
+            ),
+        },
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": 295.24,
+        "fuel_per_kwh": -1.2,
+        "levy_per_kwh": 4.18,
+    }
+
+
+async def test_get_surcharges_missing_fields_are_none() -> None:
+    agreements = [
+        {
+            "validFrom": None,
+            "validTo": None,
+            "product": {"__typename": "ElectricityFitProduct"},
+        }
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": None,
+        "fuel_per_kwh": None,
+        "levy_per_kwh": None,
+    }
+
+
+async def test_get_surcharges_ignores_non_finite_and_garbage_prices() -> None:
+    agreements = [
+        {
+            "product": _stepped_product(
+                {"pricePerUnitIncTax": "NaN"},
+                {"pricePerUnitIncTax": "abc"},
+                standing="inf",
+            )
+        }
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": None,
+        "fuel_per_kwh": None,
+        "levy_per_kwh": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"account": None},
+        {"account": {"properties": []}},
+        _surcharges_payload([]),
+        _surcharges_payload([{"validFrom": None, "product": None}]),
+    ],
+)
+async def test_get_surcharges_rejects_bad_payloads(data: dict) -> None:
+    client = _client_with_query(data)
+    with pytest.raises(OctopusApiError):
+        await client.async_get_surcharges("A-1", now=NOW)
+
+
+def test_pick_active_fallbacks() -> None:
+    expired = {"validFrom": "2025-01-01", "validTo": "2025-02-01", "id": 1}
+    future = {"validFrom": "2027-01-01", "validTo": None, "id": 2}
+    assert _pick_active([expired, future], NOW) == future
+    assert _pick_active([expired], NOW) == expired
+    assert _pick_active(["junk"], NOW) is None
+    assert _pick_active(None, NOW) is None
+
+
+def test_parse_api_datetime_variants() -> None:
+    assert _parse_api_datetime("2026-10-01") == datetime(
+        2026, 10, 1, tzinfo=timezone.utc
+    )
+    assert _parse_api_datetime("2026-10-01T00:00:00Z") == datetime(
+        2026, 10, 1, tzinfo=timezone.utc
+    )
+    assert _parse_api_datetime("not-a-date") is None
+    assert _parse_api_datetime(None) is None
 
 
 def _bills_payload() -> dict:

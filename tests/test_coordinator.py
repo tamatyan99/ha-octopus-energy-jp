@@ -34,9 +34,10 @@ from custom_components.octopus_energy_jp.const import (
 from custom_components.octopus_energy_jp.coordinator import (
     OctopusEnergyJpCoordinator,
     _attach_hourly_slot_costs,
+    _build_month_prior_index,
     _coerce_rates,
     _month_prior_daily_kwh,
-    _tiered_cost,
+    _month_prior_from_index,
 )
 
 ACCOUNT = "A-TEST1234"
@@ -616,15 +617,6 @@ async def test_tiered_cost_at_exact_boundaries(hass: HomeAssistant) -> None:
         assert data["avg_rate"] == avg_rate
 
 
-def test_tiered_cost_legacy_wrapper() -> None:
-    assert _tiered_cost(150.0, TARIFF_DICTS) == pytest.approx(4680.0)
-    assert _tiered_cost(
-        150.0,
-        [(0.0, 120.0, 30.0), (120.0, 300.0, 36.0), (300.0, None, 40.0)],
-    ) == pytest.approx(4680.0)
-    assert _tiered_cost(10.0, []) == 0.0
-
-
 def test_coerce_rates_branches() -> None:
     assert _coerce_rates(TARIFF_DICTS) == [
         (0.0, 120.0, 30.0),
@@ -732,6 +724,42 @@ def test_month_prior_daily_kwh_sums_strictly_earlier_days() -> None:
     }
     assert _month_prior_daily_kwh(daily, "2026-07", "2026-07-15") == pytest.approx(15.0)
     assert _month_prior_daily_kwh(daily, "2026-06", "2026-06-30") == 0.0
+
+
+def test_month_prior_index_matches_naive_sum_across_month_boundary() -> None:
+    """Indexed month-prior lookups must match the naive per-slot reference."""
+    june = {f"2026-06-{d:02d}": float(d) for d in range(25, 31)}
+    july = {f"2026-07-{d:02d}": float(d) for d in range(1, 16)}
+    daily = {**june, **july}
+    index = _build_month_prior_index(daily)
+    hourly: list[dict[str, Any]] = []
+    for day in sorted(daily):
+        hourly.extend(_july_hourly_slots(day, daily[day], slots=3))
+    fuel, levy = 1.5, 2.5
+    optimized = _attach_hourly_slot_costs(hourly, daily, TIERED_RATES, fuel, levy)
+    reference: list[dict[str, Any]] = []
+    same_day: dict[str, float] = {}
+    for item in sorted(hourly, key=lambda row: row["start"]):
+        start_local = dt_util.as_local(item["start"])
+        day_str = start_local.strftime("%Y-%m-%d")
+        month_key = start_local.strftime("%Y-%m")
+        kwh = float(item["kwh"])
+        cum_before = _month_prior_daily_kwh(daily, month_key, day_str) + same_day.get(
+            day_str, 0.0
+        )
+        energy = (
+            oejp_utils.tiered_cost(cum_before + kwh, TIERED_RATES)
+            - oejp_utils.tiered_cost(cum_before, TIERED_RATES)
+        )
+        cost = round(energy + (fuel + levy) * kwh, 3)
+        same_day[day_str] = same_day.get(day_str, 0.0) + kwh
+        reference.append({"start": item["start"], "kwh": kwh, "cost": cost})
+    assert [row["cost"] for row in optimized] == [row["cost"] for row in reference]
+    for mk in ("2026-06", "2026-07"):
+        for day in sorted(d for d in daily if d.startswith(mk)):
+            naive = _month_prior_daily_kwh(daily, mk, day)
+            indexed = _month_prior_from_index(index, mk, day)
+            assert indexed == pytest.approx(naive)
 
 
 async def test_hourly_cost_excludes_basic_charge(hass: HomeAssistant) -> None:

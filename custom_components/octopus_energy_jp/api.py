@@ -120,11 +120,11 @@ def _compute_retry_delay(attempt: int, retry_after: float | None) -> float:
     """Exponential backoff with jitter; honour ``Retry-After`` when provided."""
     if retry_after is not None:
         base = min(retry_after, RETRY_MAX_DELAY)
-    else:
-        base = min(
-            RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** (attempt - 1)),
-            RETRY_MAX_DELAY,
-        )
+        return base * (1.0 + random.random() * 0.2)
+    base = min(
+        RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** (attempt - 1)),
+        RETRY_MAX_DELAY,
+    )
     return base * (0.5 + random.random() * 0.5)
 
 
@@ -322,8 +322,6 @@ class OctopusEnergyJpApiClient:
                     ) from err
         except OctopusApiError:
             raise
-        except OctopusAuthError:
-            raise
         except _RetryableRequestError:
             raise
         except asyncio.CancelledError:
@@ -336,8 +334,6 @@ class OctopusEnergyJpApiClient:
             raise _RetryableRequestError(f"Connection error: {err}") from err
         except ValueError as err:
             raise OctopusApiError(f"Connection error: {err}") from err
-        except Exception as err:
-            raise OctopusApiError(f"Unexpected API error: {err}") from err
         if not isinstance(payload, dict):
             raise OctopusApiError("Unexpected API response structure")
         errors = payload.get("errors")
@@ -435,15 +431,12 @@ class OctopusEnergyJpApiClient:
         account_number: str,
         from_dt: datetime,
         to_dt: datetime,
-        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return half-hourly readings for the period.
 
         Each dict contains ``startAt``/``endAt``/``version``/``value``.
         The caller is expected to split long periods into chunks
-        (see utils.chunk_date_range). ``limit`` is kept for backward
-        compatibility but currently unused: the Kraken endpoint does
-        not accept a ``first`` argument on this field.
+        (see utils.chunk_date_range).
         """
         variables: dict[str, Any] = {
             "accountNumber": account_number,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import re
@@ -30,19 +31,6 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _tiered_cost(
-    total_kwh: float, rates: list[dict[str, Any]] | list[utils.RateTier]
-) -> float:
-    """Legacy wrapper kept for backward compatibility; delegates to utils."""
-    if not rates:
-        return 0.0
-    if isinstance(rates[0], dict):
-        normalized = utils.normalize_rates(rates)  # type: ignore[arg-type]
-    else:
-        normalized = rates  # type: ignore[assignment]
-    return utils.tiered_cost(total_kwh, normalized)
 
 
 def _coerce_rates(raw_rates: Any) -> list[utils.RateTier]:
@@ -76,6 +64,37 @@ def _month_prior_daily_kwh(
     return sum(v for d, v in daily_kwh.items() if d[:7] == month_key and d < day_str)
 
 
+def _build_month_prior_index(
+    daily_kwh: dict[str, float],
+) -> dict[str, tuple[list[str], list[float]]]:
+    """Per calendar month: sorted day keys and prefix sums for O(log n) lookups."""
+    by_month: dict[str, list[tuple[str, float]]] = {}
+    for day, kwh in daily_kwh.items():
+        by_month.setdefault(day[:7], []).append((day, kwh))
+    index: dict[str, tuple[list[str], list[float]]] = {}
+    for month_key, pairs in by_month.items():
+        pairs.sort(key=lambda item: item[0])
+        days = [day for day, _ in pairs]
+        prefix = [0.0]
+        for _, kwh in pairs:
+            prefix.append(prefix[-1] + kwh)
+        index[month_key] = (days, prefix)
+    return index
+
+
+def _month_prior_from_index(
+    index: dict[str, tuple[list[str], list[float]]],
+    month_key: str,
+    day_str: str,
+) -> float:
+    """Cumulative kWh in ``month_key`` on days strictly before ``day_str``."""
+    entry = index.get(month_key)
+    if entry is None:
+        return 0.0
+    days, prefix = entry
+    return prefix[bisect.bisect_left(days, day_str)]
+
+
 def _attach_hourly_slot_costs(
     hourly: list[dict[str, Any]],
     daily_kwh: dict[str, float],
@@ -94,6 +113,7 @@ def _attach_hourly_slot_costs(
     cannot be prorated per hour without breaking stability.
     """
     surcharge_per_kwh = fuel_per_kwh + levy_per_kwh
+    month_prior_index = _build_month_prior_index(daily_kwh)
     enriched: list[dict[str, Any]] = []
     same_day_kwh: dict[str, float] = {}
     for item in sorted(hourly, key=lambda row: row["start"]):
@@ -102,9 +122,9 @@ def _attach_hourly_slot_costs(
         start_local = dt_util.as_local(start)
         day_str = start_local.strftime("%Y-%m-%d")
         month_key = start_local.strftime("%Y-%m")
-        cum_before = _month_prior_daily_kwh(daily_kwh, month_key, day_str) + (
-            same_day_kwh.get(day_str, 0.0)
-        )
+        cum_before = _month_prior_from_index(
+            month_prior_index, month_key, day_str
+        ) + same_day_kwh.get(day_str, 0.0)
         energy = utils.tiered_cost(cum_before + kwh, rates) - utils.tiered_cost(
             cum_before, rates
         )
@@ -245,7 +265,7 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for chunk_start, chunk_end in chunks:
             try:
                 part = await self.api.async_get_readings(
-                    self.account_number, chunk_start, chunk_end, limit=5000
+                    self.account_number, chunk_start, chunk_end
                 )
             except OctopusAuthError:
                 raise

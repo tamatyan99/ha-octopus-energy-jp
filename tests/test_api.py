@@ -291,9 +291,9 @@ async def test_post_timeout_becomes_api_error() -> None:
     assert session.post.call_count == 3
 
 
-async def test_post_unexpected_error_is_wrapped() -> None:
+async def test_post_unexpected_error_propagates() -> None:
     client, _ = _client_with_posts([RuntimeError("weird")])
-    with pytest.raises(OctopusApiError, match="Unexpected API error"):
+    with pytest.raises(RuntimeError, match="weird"):
         await client._async_post({"query": "q"})
 
 
@@ -355,7 +355,7 @@ async def test_post_honours_retry_after_header() -> None:
     assert session.post.call_count == 2
     sleep_mock.assert_awaited_once()
     delay = sleep_mock.await_args.args[0]
-    assert 2.0 <= delay <= 4.0
+    assert 4.0 <= delay <= 4.0 * 1.2
 
 
 async def test_post_retries_on_timeout_then_succeeds() -> None:
@@ -465,7 +465,7 @@ async def test_post_retry_after_caps_large_values() -> None:
     with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
         assert await client._async_post({"query": "q"}) == ok
     delay = sleep_mock.await_args.args[0]
-    assert delay <= 8.0
+    assert 8.0 <= delay <= 8.0 * 1.2
 
 
 async def test_post_value_error_on_transport_raises_api_error() -> None:
@@ -717,15 +717,6 @@ async def test_get_readings_returns_list() -> None:
         )
         == rows
     )
-
-
-async def test_get_readings_accepts_limit_kwarg() -> None:
-    rows = [{"startAt": "2024-05-01T00:00:00+09:00", "value": 0.1}]
-    client = _client_with_query(_readings_payload(rows))
-    result = await client.async_get_readings(
-        "A-1", datetime(2024, 5, 1), datetime(2024, 5, 2), limit=5
-    )
-    assert result == rows
 
 
 @pytest.mark.parametrize(

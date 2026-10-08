@@ -22,6 +22,9 @@ from .utils import cost_statistic_id_for_account, statistic_id_for_account
 
 _LOGGER = logging.getLogger(__name__)
 
+# Seeded in _recover_baseline_from_recorder so widen-into-past never runs on recovery.
+_RECOVERY_EARLIEST_UTC = datetime(1970, 1, 1, tzinfo=UTC)
+
 SeriesKind = Literal["consumption", "cost"]
 
 
@@ -55,6 +58,7 @@ class OctopusStatisticsImporter:
             store_key = f"{DOMAIN}_{entry_id}_statistics_cost"
             self._statistic_id = cost_statistic_id_for_account(DOMAIN, account_number)
             self._statistic_name = f"Octopus Energy Japan cost ({account_number})"
+            # HA Core cost external stats (opower, srp_energy) also omit unit_class/UoM.
             self._unit_class: str | None = None
             self._unit_of_measurement: str | None = None
             self._value_key = "cost"
@@ -117,8 +121,9 @@ class OctopusStatisticsImporter:
             return
         try:
             raw_start = last_row.get("start")
-            start_ms = float(raw_start)  # type: ignore[arg-type]
-            start = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
+            start_s = float(raw_start)  # type: ignore[arg-type]
+            # Recorder rows use start_ts epoch seconds (not WebSocket ms).
+            start = datetime.fromtimestamp(start_s, tz=UTC)
         except (TypeError, ValueError, OverflowError, OSError):
             _LOGGER.debug("Ignoring recorder baseline with unusable start: %r", rows)
             return
@@ -136,7 +141,7 @@ class OctopusStatisticsImporter:
         # fires on the recovered path. A from-0 full re-import over the ~1
         # month API window would overwrite recorder rows that continue an
         # older cumulative sum; only strictly newer buckets are imported.
-        self._earliest_start = dt_util.as_local(datetime(1970, 1, 1, tzinfo=UTC))
+        self._earliest_start = dt_util.as_local(_RECOVERY_EARLIEST_UTC)
         self._cumulative = baseline
         _LOGGER.warning(
             "Local statistics state was missing; recovered baseline from "
@@ -229,9 +234,13 @@ class OctopusStatisticsImporter:
             overlap = [s for s in settled if s["start"] <= self._last_start]
             targets = [s for s in settled if s["start"] > self._last_start]
             if overlap and settled[0]["start"] == self._earliest_start:
-                # 訂正追従の簡易策: settled が既知範囲全体を覆う場合、
-                # 既存累積と settled 合計の不整合は過去値の訂正とみなして
-                # settled 全体を再投入（上書き冪等）する
+                # 訂正追従: fresh_total は現ウィンドウ内の合計、_cumulative は
+                # ウィンドウより古い prefix を含む生涯累積。settled[0] ==
+                # _earliest_start のときだけ prefix==0 で比較が成立する。月次で
+                # ウィンドウが進み settled[0] > earliest になったら不一致は常に
+                # prefix 分であり訂正ではない。ここを緩めて再ベースすると累積が
+                # 0 付近に潰れ Energy Dashboard が壊れる（+1.0 が -71.0 等）。
+                # 古いバケットの訂正追従にはバケット単位の永続化が必要（本リリース外）。
                 fresh_total = sum(s[value_key] for s in settled)
                 expected = cumulative + sum(s[value_key] for s in targets)
                 if abs(fresh_total - expected) > 1e-6:
@@ -256,8 +265,7 @@ class OctopusStatisticsImporter:
                 point["state"] = round(delta, 3)
             points.append(point)
 
-        if not points:
-            return
+        assert points, "targets non-empty implies at least one statistic point"
 
         metadata: StatisticMetaData = {
             "mean_type": StatisticMeanType.NONE,
@@ -273,8 +281,7 @@ class OctopusStatisticsImporter:
         if self._earliest_start is None:
             self._earliest_start = targets[0]["start"]
         self._cumulative = cumulative
-        if self._last_start is None:
-            return
+        assert self._last_start is not None
         earliest = self._earliest_start
         payload: dict[str, Any] = {
             "last_start": self._last_start.isoformat(),

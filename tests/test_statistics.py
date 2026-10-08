@@ -62,8 +62,9 @@ def _hourly(start: datetime, kwh_values: list[float]) -> list[dict[str, Any]]:
     ]
 
 
-def _epoch_ms(value: datetime) -> float:
-    return value.astimezone(UTC).timestamp() * 1000
+def _epoch_s(value: datetime) -> float:
+    """Recorder ``start`` field is epoch seconds (not WebSocket milliseconds)."""
+    return value.astimezone(UTC).timestamp()
 
 
 def _new_importer(
@@ -101,8 +102,8 @@ def _recorder_patches(rows: Any):
     )
 
 
-def _dict_rows(statistic_id: str, start_ms: float, total: Any) -> dict[str, Any]:
-    return {statistic_id: [{"start": start_ms, "sum": total, "state": total}]}
+def _dict_rows(statistic_id: str, start_s: float, total: Any) -> dict[str, Any]:
+    return {statistic_id: [{"start": start_s, "sum": total, "state": total}]}
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ async def test_recover_baseline_dict_shape_seeds_state_and_warns(
     importer = _new_importer(hass)
     start_local = _jst(14, 2)
     get_patch, fn_patch, instance = _recorder_patches(
-        _dict_rows(STATISTIC_ID, _epoch_ms(start_local), 12.5)
+        _dict_rows(STATISTIC_ID, _epoch_s(start_local), 12.5)
     )
     with _frozen_jst(), get_patch, fn_patch, caplog.at_level(logging.WARNING):
         await importer._recover_baseline_from_recorder()
@@ -138,7 +139,7 @@ async def test_recover_baseline_bare_list_shape(hass: HomeAssistant) -> None:
     importer = _new_importer(hass)
     start_local = _jst(14, 5)
     get_patch, fn_patch, _ = _recorder_patches(
-        [{"start": _epoch_ms(start_local), "sum": 7.25}]
+        [{"start": _epoch_s(start_local), "sum": 7.25}]
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
@@ -156,7 +157,7 @@ async def test_recover_baseline_bad_sum_coerced_to_zero(
     importer = _new_importer(hass)
     start_local = _jst(14, 2)
     get_patch, fn_patch, _ = _recorder_patches(
-        _dict_rows(STATISTIC_ID, _epoch_ms(start_local), raw_sum)
+        _dict_rows(STATISTIC_ID, _epoch_s(start_local), raw_sum)
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
@@ -623,13 +624,100 @@ async def test_async_import_store_save_failure_tolerated(
 # ---------------------------------------------------------------------------
 
 
+async def test_recover_baseline_epoch_seconds_import_no_double_count(
+    hass: HomeAssistant,
+) -> None:
+    """Regression: ms mis-parse made _last_start ~1970 and re-imported all buckets."""
+    importer = _new_importer(hass, "import-recover-no-dup")
+    recovered_start = _jst(14, 2)
+    baseline_sum = 10.0
+    get_patch, fn_patch, _ = _recorder_patches(
+        _dict_rows(STATISTIC_ID, _epoch_s(recovered_start), baseline_sum)
+    )
+    with _frozen_jst(), get_patch, fn_patch:
+        await importer.async_load()
+    assert importer._cumulative == pytest.approx(baseline_sum)
+    assert importer._last_start == recovered_start
+
+    hourly = _hourly(_jst(14, 0), [0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    with (
+        _frozen_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly)
+    points = mock_add.call_args[0][2]
+    assert len(points) == 3
+    assert points[0]["sum"] == pytest.approx(baseline_sum + 0.8)
+    assert points[-1]["sum"] == pytest.approx(baseline_sum + 0.8 + 0.9 + 1.0)
+    assert all(point["sum"] < baseline_sum + 5 for point in points)
+
+
+def _sep_jst(day: int, hour: int = 0) -> datetime:
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    return datetime(2026, 9, day, hour, tzinfo=tz)
+
+
+@contextmanager
+def _frozen_september_jst() -> Iterator[datetime]:
+    """Freeze at 2026-09-10 12:00 JST so September hourly buckets are settled."""
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    try:
+        with freeze_time("2026-09-10 03:00:00"):
+            yield dt_util.now()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+
+async def test_async_import_window_advance_no_false_revision_reimport(
+    hass: HomeAssistant,
+) -> None:
+    """Advanced fetch window (prefix dropped) must not trigger revision re-import."""
+    importer = _new_importer(hass, "import-window-advance")
+    base1 = _sep_jst(1, 0)
+    hourly1 = [
+        {"start": base1 + timedelta(hours=i), "kwh": 1.0} for i in range(72)
+    ]
+    base2 = _sep_jst(2, 0)
+    hourly2 = [
+        {"start": base2 + timedelta(hours=i), "kwh": 1.0} for i in range(72)
+    ]
+    with (
+        _frozen_september_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly1)
+        pts1 = mock_add.call_args[0][2]
+        assert len(pts1) == 72
+        assert pts1[-1]["sum"] == pytest.approx(72.0)
+        assert importer._cumulative == pytest.approx(72.0)
+        mock_add.reset_mock()
+        await importer.async_import(hourly2)
+    assert mock_add.call_count == 1
+    pts2 = mock_add.call_args[0][2]
+    assert len(pts2) == 24
+    first_new = pts2[0]
+    dashboard_delta = first_new["sum"] - pts1[-1]["sum"]
+    assert dashboard_delta == pytest.approx(1.0)
+    assert first_new["sum"] == pytest.approx(73.0)
+    assert pts2[-1]["sum"] == pytest.approx(96.0)
+    assert importer._cumulative == pytest.approx(96.0)
+
+
 async def test_recovered_baseline_end_to_end_continues_cumulative(
     hass: HomeAssistant,
 ) -> None:
     importer = _new_importer(hass, "import-recovered")
     recovered_start = _jst(14, 2)
     get_patch, fn_patch, _ = _recorder_patches(
-        _dict_rows(STATISTIC_ID, _epoch_ms(recovered_start), 10.0)
+        _dict_rows(STATISTIC_ID, _epoch_s(recovered_start), 10.0)
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
@@ -754,7 +842,7 @@ async def test_cost_recover_baseline_queries_cost_statistic_id(
     importer = _new_cost_importer(hass)
     start_local = _jst(14, 2)
     get_patch, fn_patch, instance = _recorder_patches(
-        _dict_rows(COST_STATISTIC_ID, _epoch_ms(start_local), 99.0)
+        _dict_rows(COST_STATISTIC_ID, _epoch_s(start_local), 99.0)
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()

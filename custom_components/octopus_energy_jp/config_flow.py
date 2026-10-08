@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
@@ -94,6 +95,7 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         entry: config_entries.ConfigEntry,
         user_input: dict[str, Any],
+        abort_reason: str,
     ) -> tuple[dict[str, str], config_entries.ConfigFlowResult | None]:
         """Validate credentials and update the entry when the account matches."""
         errors, account = await self._async_validate(
@@ -102,7 +104,7 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if errors:
             return errors, None
         if account == entry.unique_id:
-            return {}, self.async_update_reload_and_abort(
+            self.hass.config_entries.async_update_entry(
                 entry,
                 data={
                     CONF_EMAIL: user_input[CONF_EMAIL],
@@ -110,10 +112,11 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_ACCOUNT_NUMBER: account,
                 },
             )
+            return {}, self.async_abort(reason=abort_reason)
         return {"base": "account_mismatch"}, None
 
     async def async_step_reauth(
-        self, entry_data: dict[str, Any]
+        self, _user_input: Mapping[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Handle re-authentication when credentials stop working."""
         return await self.async_step_reauth_confirm()
@@ -125,7 +128,9 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors, result = await self._async_try_update_credentials(entry, user_input)
+            errors, result = await self._async_try_update_credentials(
+                entry, user_input, "reauth_successful"
+            )
             if result is not None:
                 return result
         return self.async_show_form(
@@ -139,7 +144,9 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors, result = await self._async_try_update_credentials(entry, user_input)
+            errors, result = await self._async_try_update_credentials(
+                entry, user_input, "reconfigure_successful"
+            )
             if result is not None:
                 return result
         return self.async_show_form(

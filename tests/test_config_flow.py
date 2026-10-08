@@ -136,7 +136,61 @@ async def test_reauth_flow_updates_entry(hass):
         await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_EMAIL] == "new@example.com"
+
+
+async def test_credential_update_uses_listener_not_update_reload_and_abort(hass):
+    """Entry data updates rely on the update listener for a single reload."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    entry.add_to_hass(hass)
+
+    reload_calls = 0
+
+    async def _listener(_hass, _updated_entry):
+        nonlocal reload_calls
+        reload_calls += 1
+
+    entry.add_update_listener(_listener)
+
+    schedule_reload = MagicMock()
+    update_reload_and_abort = MagicMock()
+
+    with (
+        patch(
+            "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+            _patched_client(account=ACCOUNT),
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_schedule_reload",
+            schedule_reload,
+        ),
+        patch.object(
+            config_entries.ConfigFlow,
+            "async_update_reload_and_abort",
+            update_reload_and_abort,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "newpw"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_EMAIL] == "new@example.com"
+    assert entry.data[CONF_PASSWORD] == "newpw"
+    update_reload_and_abort.assert_not_called()
+    schedule_reload.assert_not_called()
+    assert reload_calls == 1
 
 
 async def test_reconfigure_flow_updates_entry(hass):

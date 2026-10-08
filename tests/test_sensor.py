@@ -125,6 +125,7 @@ def test_diff_sensors_are_diagnostic_measurements(key):
     """Comparison sensors are diagnostic MEASUREMENT values."""
     description = _by_key()[key]
     assert description.state_class == SensorStateClass.MEASUREMENT
+    assert description.device_class is None
     assert description.entity_category == EntityCategory.DIAGNOSTIC
 
 

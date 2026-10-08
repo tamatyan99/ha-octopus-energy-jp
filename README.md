@@ -53,8 +53,8 @@ Energy Dashboard 用の外部統計を提供します。
 
 ### アンインストール / Removal
 
-1. **設定 → デバイスとサービス → Octopus Energy Japan → ⋮ → 削除** で統合エントリを削除します
-   （統合が保存していた日次履歴・統計の永続データも同時に削除されます）。
+1. **設定 → デバイスとサービス → Octopus Energy Japan → ⋮ → 削除** で統合エントリを削除します。
+   削除すると Recorder の統計（消費量・コスト、`octopus_energy_jp:<slug>_*`）も**完全に消去**され、元に戻せません。再追加後は API から先のデータのみ取り込まれ、過去の履歴は復元されません。
 2. HACS から入れた場合は HACS → 連携 → **Octopus Energy Japan** → ⋮ → **削除** でファイルを削除します。
 3. Energy Dashboard の消費量に登録していた場合は、**設定 → ダッシュボード → エネルギー** から該当ソースを削除します。
 4. 手動で入れた場合は `config/custom_components/octopus_energy_jp/` を削除して Home Assistant を再起動します。

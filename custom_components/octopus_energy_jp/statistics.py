@@ -82,11 +82,12 @@ class OctopusStatisticsImporter:
     async def _recover_baseline_from_recorder(self) -> None:
         """Seed import state from the recorder when the local store is gone.
 
-        Deleting and re-adding the config entry (new entry_id, same
-        statistic_id), a corrupt/missing store, or a storage version change
-        would otherwise restart the cumulative sum from 0 and overwrite
-        existing recorder rows with lower sums. Consult the recorder's last
-        stored row instead and continue from there.
+        A corrupt or missing store, a storage version change, or restoring from
+        backup without the integration's storage would otherwise restart the
+        cumulative sum from 0 and overwrite existing recorder rows with lower
+        sums. Consult the recorder's last stored row instead and continue from
+        there. Removing the config entry clears both the integration stores and
+        its recorder statistics; re-adding starts fresh from the API only.
         """
         try:
             from homeassistant.components.recorder import get_instance

@@ -120,7 +120,7 @@ def _compute_retry_delay(attempt: int, retry_after: float | None) -> float:
     """Exponential backoff with jitter; honour ``Retry-After`` when provided."""
     if retry_after is not None:
         base = min(retry_after, RETRY_MAX_DELAY)
-        return base * (1.0 + random.random() * 0.2)
+        return min(base * (1.0 + random.random() * 0.2), RETRY_MAX_DELAY)
     base = min(
         RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** (attempt - 1)),
         RETRY_MAX_DELAY,

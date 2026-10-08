@@ -140,6 +140,48 @@ async def test_reauth_flow_updates_entry(hass):
     assert entry.data[CONF_EMAIL] == "new@example.com"
 
 
+async def test_credential_update_unchanged_schedules_reload(hass):
+    """Unchanged credentials still trigger exactly one reload via schedule."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    entry.add_to_hass(hass)
+    data_before = dict(entry.data)
+
+    schedule_reload = MagicMock()
+
+    with (
+        patch(
+            "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+            _patched_client(account=ACCOUNT),
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_schedule_reload",
+            schedule_reload,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_REAUTH,
+                "entry_id": entry.entry_id,
+            },
+            data=entry.data,
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_EMAIL: ENTRY_DATA[CONF_EMAIL],
+                CONF_PASSWORD: ENTRY_DATA[CONF_PASSWORD],
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert entry.data == data_before
+    schedule_reload.assert_called_once_with(entry.entry_id)
+
+
 async def test_credential_update_uses_listener_not_update_reload_and_abort(hass):
     """Entry data updates rely on the update listener for a single reload."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))

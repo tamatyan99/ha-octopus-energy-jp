@@ -104,7 +104,7 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if errors:
             return errors, None
         if account == entry.unique_id:
-            self.hass.config_entries.async_update_entry(
+            changed = self.hass.config_entries.async_update_entry(
                 entry,
                 data={
                     CONF_EMAIL: user_input[CONF_EMAIL],
@@ -112,6 +112,8 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_ACCOUNT_NUMBER: account,
                 },
             )
+            if not changed:
+                self.hass.config_entries.async_schedule_reload(entry.entry_id)
             return {}, self.async_abort(reason=abort_reason)
         return {"base": "account_mismatch"}, None
 

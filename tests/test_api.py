@@ -10,6 +10,7 @@ import aiohttp
 import pytest
 
 from custom_components.octopus_energy_jp.api import (
+    RETRY_MAX_DELAY,
     OctopusApiError,
     OctopusAuthError,
     OctopusEnergyJpApiClient,
@@ -465,7 +466,10 @@ async def test_post_retry_after_caps_large_values() -> None:
     with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
         assert await client._async_post({"query": "q"}) == ok
     delay = sleep_mock.await_args.args[0]
-    assert 8.0 <= delay <= 8.0 * 1.2
+    retry_after = 120.0
+
+    assert delay >= min(retry_after, RETRY_MAX_DELAY)
+    assert delay <= RETRY_MAX_DELAY
 
 
 async def test_post_value_error_on_transport_raises_api_error() -> None:

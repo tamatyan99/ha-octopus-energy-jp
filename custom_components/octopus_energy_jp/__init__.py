@@ -34,32 +34,45 @@ def _get_hourly(data: Any) -> list | None:
     return hourly
 
 
-def _kwh_from_hourly_row(row: Any) -> float:
-    """hourly 行から kWh を安全に取り出す（シグネチャ用、I/O なし）。"""
+def _hourly_metric(row: Any, key: str) -> float:
+    """hourly 行から数値を安全に取り出す（シグネチャ用、I/O なし）。"""
     try:
         if isinstance(row, dict):
-            return float(row.get("kwh") or 0)
-        return float(getattr(row, "kwh", 0) or 0)
+            raw = row.get(key)
+        else:
+            raw = getattr(row, key, None)
+        if raw is None:
+            return 0.0
+        return float(raw)
     except Exception:  # noqa: BLE001
         return 0.0
 
 
 def _hourly_signature(hourly: list) -> tuple:
-    """hourly の簡易シグネチャ（件数 + 最終start + 値ダイジェスト）を返す。"""
+    """hourly の簡易シグネチャ（件数 + 最終start + kWh/料金ダイジェスト）を返す。"""
     try:
         last = hourly[-1] if hourly else None
         if isinstance(last, dict):
             last_start = last.get("start")
         else:
             last_start = getattr(last, "start", last)
-        total_kwh = round(sum(_kwh_from_hourly_row(row) for row in hourly), 4)
-        last_kwh = round(_kwh_from_hourly_row(last) if last is not None else 0.0, 4)
-        return (len(hourly), str(last_start), total_kwh, last_kwh)
+        total_kwh = round(sum(_hourly_metric(row, "kwh") for row in hourly), 4)
+        last_kwh = round(_hourly_metric(last, "kwh") if last is not None else 0.0, 4)
+        total_cost = round(sum(_hourly_metric(row, "cost") for row in hourly), 4)
+        last_cost = round(_hourly_metric(last, "cost") if last is not None else 0.0, 4)
+        return (
+            len(hourly),
+            str(last_start),
+            total_kwh,
+            last_kwh,
+            total_cost,
+            last_cost,
+        )
     except Exception:  # noqa: BLE001 - シグネチャ計算の失敗ではimportを止めない
         try:
-            return (len(hourly), "", 0.0, 0.0)
+            return (len(hourly), "", 0.0, 0.0, 0.0, 0.0)
         except Exception:  # noqa: BLE001
-            return (0, "", 0.0, 0.0)
+            return (0, "", 0.0, 0.0, 0.0, 0.0)
 
 
 async def _async_reload_on_update(hass: HomeAssistant, entry: ConfigEntry) -> None:

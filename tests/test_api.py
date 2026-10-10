@@ -99,7 +99,6 @@ def _client_with_query(result: dict | None = None, error: Exception | None = Non
         "not authorized",
         "Not Authorized",
         "invalid token",
-        "expired",
     ],
 )
 def test_is_auth_error_positive_variants(message: str) -> None:
@@ -115,6 +114,9 @@ def test_is_auth_error_positive_variants(message: str) -> None:
         "timeout while fetching readings",
         "author biography updated",
         "authorizing user profile",
+        "expired",
+        "tariff expired",
+        "The product expired",
         "",
     ],
 )

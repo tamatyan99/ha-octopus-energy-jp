@@ -86,20 +86,43 @@ def test_get_hourly_and_signature_helpers() -> None:
     assert _get_hourly({"hourly": []}) is None
     hourly = [{"start": "2026-07-14T01:00:00+09:00", "kwh": 1.0}]
     assert _get_hourly({"hourly": hourly}) == hourly
-    assert _hourly_signature(hourly) == (1, "2026-07-14T01:00:00+09:00", 1.0, 1.0)
-    assert _hourly_signature([{"start": 42}]) == (1, "42", 0.0, 0.0)
+    assert _hourly_signature(hourly) == (
+        1,
+        "2026-07-14T01:00:00+09:00",
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+    )
+    assert _hourly_signature([{"start": 42}]) == (1, "42", 0.0, 0.0, 0.0, 0.0)
+    priced = [
+        {"start": "2026-07-14T01:00:00+09:00", "kwh": 1.0, "cost": 10.0},
+        {"start": "2026-07-14T02:00:00+09:00", "kwh": 1.0, "cost": 12.0},
+    ]
+    other_price = [
+        {"start": "2026-07-14T01:00:00+09:00", "kwh": 1.0, "cost": 10.0},
+        {"start": "2026-07-14T02:00:00+09:00", "kwh": 1.0, "cost": 99.0},
+    ]
+    assert _hourly_signature(priced) != _hourly_signature(other_price)
 
     class _Row:
         start = "object-start"
 
-    assert _hourly_signature([_Row()]) == (1, "object-start", 0.0, 0.0)
-    assert _hourly_signature(["bad"]) == (1, "bad", 0.0, 0.0)
+    assert _hourly_signature([_Row()]) == (1, "object-start", 0.0, 0.0, 0.0, 0.0)
+    assert _hourly_signature(["bad"]) == (1, "bad", 0.0, 0.0, 0.0, 0.0)
 
     class _UnstrableStart:
         def __str__(self) -> str:
             raise ValueError("no str")
 
-    assert _hourly_signature([{"start": _UnstrableStart()}]) == (1, "", 0.0, 0.0)
+    assert _hourly_signature([{"start": _UnstrableStart()}]) == (
+        1,
+        "",
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
 
     class _LenAlwaysFails:
         def __getitem__(self, _idx: int) -> dict[str, str]:
@@ -108,7 +131,7 @@ def test_get_hourly_and_signature_helpers() -> None:
         def __len__(self) -> int:
             raise TypeError("no len")
 
-    assert _hourly_signature(_LenAlwaysFails()) == (0, "", 0.0, 0.0)
+    assert _hourly_signature(_LenAlwaysFails()) == (0, "", 0.0, 0.0, 0.0, 0.0)
 
 
 async def test_async_reload_on_update_requests_entry_reload(hass) -> None:

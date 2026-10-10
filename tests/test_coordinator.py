@@ -36,6 +36,7 @@ from custom_components.octopus_energy_jp.coordinator import (
     _attach_hourly_slot_costs,
     _build_month_prior_index,
     _coerce_rates,
+    _compare_month_to_date,
     _month_prior_daily_kwh,
     _month_prior_from_index,
 )
@@ -713,6 +714,19 @@ def test_attach_hourly_slot_costs_tolerates_missing_daily_and_empty_daily() -> N
     assert len(out) == 2
     out_empty = _attach_hourly_slot_costs(slots, {}, TIERED_RATES, 0.0, 0.0)
     assert len(out_empty) == 2
+
+
+def test_compare_month_to_date_caps_both_sides_at_previous_month_length() -> None:
+    daily = {f"2026-02-{day:02d}": 1.0 for day in range(1, 29)}
+    daily.update({f"2026-03-{day:02d}": 1.0 for day in range(1, 32)})
+    current, previous = _compare_month_to_date(daily, datetime(2026, 3, 31, 12, 0))
+    assert current == 28.0
+    assert previous == 28.0
+    mid_current, mid_previous = _compare_month_to_date(
+        daily, datetime(2026, 3, 15, 12, 0)
+    )
+    assert mid_current == 14.0
+    assert mid_previous == 14.0
 
 
 def test_month_prior_daily_kwh_sums_strictly_earlier_days() -> None:

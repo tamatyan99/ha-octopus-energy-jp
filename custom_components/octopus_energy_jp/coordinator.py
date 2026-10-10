@@ -57,6 +57,40 @@ def _coerce_rates(raw_rates: Any) -> list[utils.RateTier]:
     return clean
 
 
+def _compare_month_to_date(
+    daily_kwh: dict[str, float], now: datetime
+) -> tuple[float, float]:
+    """Return current and previous totals over the same number of days.
+
+    The current side is this calendar month through yesterday. The previous
+    side is the same count of days from the start of the previous month.
+    When yesterday would run past the previous month (31 March versus
+    February), both sides stop at the previous month's length.
+    """
+    elapsed = now.day - 1
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prev_last = month_start - timedelta(days=1)
+    compare_days = min(elapsed, prev_last.day)
+    current_key = month_start.strftime("%Y-%m")
+    previous_key = prev_last.strftime("%Y-%m")
+
+    def _sum_first_days(month_key: str) -> float:
+        total = 0.0
+        prefix = f"{month_key}-"
+        for day, kwh in daily_kwh.items():
+            if not day.startswith(prefix):
+                continue
+            try:
+                day_num = int(day[8:10])
+            except ValueError:
+                continue
+            if 1 <= day_num <= compare_days:
+                total += kwh
+        return total
+
+    return _sum_first_days(current_key), _sum_first_days(previous_key)
+
+
 def _month_prior_daily_kwh(
     daily_kwh: dict[str, float], month_key: str, day_str: str
 ) -> float:
@@ -397,12 +431,10 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if has_prev_month
             else None
         )
-        # 前月比較: 当月（昨日まで）と前月の同じ日数分を比較
-        cur_through_yesterday = month_kwh - today_kwh
-        prev_through_same = sum(
-            v
-            for d, v in daily_kwh.items()
-            if d.startswith(prev_month_key) and int(d[8:10]) < now.day
+        # 前月比較: 当月（昨日まで）と前月の同じ日数分を比較。
+        # 前月の方が短い月末は、両方を前月の日数で打ち切る。
+        cur_through_yesterday, prev_through_same = _compare_month_to_date(
+            daily_kwh, now
         )
         month_diff_kwh = (
             round(cur_through_yesterday - prev_through_same, 1)

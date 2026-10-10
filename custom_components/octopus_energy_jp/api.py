@@ -47,7 +47,6 @@ AUTH_ERROR_HINTS = (
     "jwt",
     "signature has expired",
     "token expired",
-    "expired",
     "invalid token",
     "invalid credentials",
     "invalid email or password",

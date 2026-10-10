@@ -391,6 +391,11 @@ def compute_billing(
     if not in_period:
         return None
     total_kwh = sum(daily_kwh[day] for day in in_period)
+    # 段階は暦月でリセットする。期間全体を一つの使用量として計算すると、
+    # 検針期間が月をまたいだときに次の段階へ早く入る。
+    monthly_kwh: dict[str, float] = {}
+    for day in in_period:
+        monthly_kwh[day[:7]] = monthly_kwh.get(day[:7], 0.0) + daily_kwh[day]
     try:
         span = (
             datetime.strptime(to_day, "%Y-%m-%d").date()
@@ -399,7 +404,9 @@ def compute_billing(
         period_days = span if span > 0 else len(in_period)
     except (ValueError, TypeError):
         period_days = len(in_period)
-    energy_cost = tiered_cost(total_kwh, rates)
+    energy_cost = sum(
+        tiered_cost(month_kwh, rates) for month_kwh in monthly_kwh.values()
+    )
     basic_charge = basic_per_day * period_days if basic_per_day else 0.0
     fuel_adjustment = fuel_per_kwh * total_kwh if fuel_per_kwh else 0.0
     renewable_levy = levy_per_kwh * total_kwh if levy_per_kwh else 0.0

@@ -524,11 +524,11 @@ async def test_async_import_skips_invalid_and_unsettled(
             await importer.async_import(hourly)
     assert mock_add.call_count == 1
     points = mock_add.call_args[0][2]
-    # settled_one (0.5, then duplicate-hour 0.25 sorts adjacent), settled_two.
-    assert len(points) == 3
-    assert points[0]["sum"] == pytest.approx(0.5)
-    assert points[1]["sum"] == pytest.approx(0.75)
-    assert points[2]["sum"] == pytest.approx(1.35)
+    # Duplicate settled_one keeps 0.25 (the later value), then settled_two.
+    # Same hour twice: the later value wins, so the hour is imported once.
+    assert len(points) == 2
+    assert points[0]["sum"] == pytest.approx(0.25)
+    assert points[1]["sum"] == pytest.approx(0.85)
     assert all(
         point["start"] <= dt_util.as_utc(now - STATS_IMPORT_BUFFER) for point in points
     )
@@ -705,6 +705,54 @@ async def test_async_import_window_advance_no_false_revision_reimport(
     assert first_new["sum"] == pytest.approx(73.0)
     assert pts2[-1]["sum"] == pytest.approx(96.0)
     assert importer._cumulative == pytest.approx(96.0)
+
+
+async def test_async_import_revises_in_window_hour_keeps_prefix(
+    hass: HomeAssistant,
+) -> None:
+    """A cost change after the window scrolls must not restart the sum at 0."""
+    importer = _new_cost_importer(hass, "import-revise-prefix")
+    base1 = _sep_jst(1, 0)
+    hourly1 = [
+        {"start": base1 + timedelta(hours=i), "kwh": 1.0, "cost": 10.0}
+        for i in range(72)
+    ]
+    base2 = _sep_jst(2, 0)
+    hourly2 = [
+        {"start": base2 + timedelta(hours=i), "kwh": 1.0, "cost": 10.0}
+        for i in range(72)
+    ]
+    revised = [dict(item) for item in hourly2]
+    revised[1]["cost"] = 50.0
+    with (
+        _frozen_september_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly1)
+        await importer.async_import(hourly2)
+        assert importer._cumulative == pytest.approx(960.0)
+        assert importer._prefix_sum == pytest.approx(240.0)
+        mock_add.reset_mock()
+        await importer.async_import(revised)
+        assert mock_add.call_count == 1
+        points = mock_add.call_args[0][2]
+        assert points[0]["start"] == dt_util.as_utc(base2)
+        assert points[0]["sum"] == pytest.approx(250.0)
+        assert points[1]["start"] == dt_util.as_utc(base2 + timedelta(hours=1))
+        assert points[1]["state"] == pytest.approx(50.0)
+        assert points[1]["sum"] == pytest.approx(300.0)
+        assert points[-1]["sum"] == pytest.approx(1000.0)
+        assert importer._cumulative == pytest.approx(1000.0)
+        assert importer._prefix_sum == pytest.approx(240.0)
+
+        reloaded = _new_cost_importer(hass, "import-revise-prefix")
+        await reloaded.async_load()
+        assert reloaded._cumulative == pytest.approx(1000.0)
+        assert reloaded._prefix_sum == pytest.approx(240.0)
+        assert reloaded._buckets is not None
+        assert reloaded._buckets[base2 + timedelta(hours=1)] == pytest.approx(50.0)
 
 
 async def test_recovered_baseline_end_to_end_continues_cumulative(

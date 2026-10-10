@@ -231,6 +231,7 @@ pytest tests/ -q --cov=custom_components.octopus_energy_jp --cov-fail-under=90
 - カバレッジゲートはパッケージ全体で 90%。
   モジュール別の現状: diagnostics 100% / utils 100% / api 99% / `__init__.py` 98% / statistics 97% / coordinator 97% / sensor 95% / config_flow 93%。
 - CI（`hassfest` / `hacs` / `test`）で同じ検証が自動実行されます。
+- 開発者・AI エージェント向けの**不変条件**（統計の契約、触ってはいけない箇所、リリース手順）は [AGENTS.md](AGENTS.md) にまとめています。変更前に必ず確認してください。
 
 ## ライセンス
 

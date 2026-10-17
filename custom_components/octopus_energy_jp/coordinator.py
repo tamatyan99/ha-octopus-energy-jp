@@ -134,7 +134,8 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._static_fetched_at: datetime | None = None
         self._contract: dict[str, Any] | None = None
         self._rates: list[utils.RateTier] | None = None
-        # 契約から取得した基本料金・燃料費調整額・再エネ賦課金 (オプション未設定時に使用)
+        # 契約から取得した基本料金・燃料費調整額・再エネ賦課金
+        # (オプション未設定時に使用)
         self._surcharges: dict[str, float | None] = {}
         # API の保持期間（約1か月）を補う日次履歴の永続ストア
         self._store: Store[dict[str, Any]] = Store(

@@ -7,7 +7,7 @@ import logging
 import math
 import random
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
@@ -29,6 +29,14 @@ RETRY_MAX_DELAY = 8.0
 RETRY_AFTER_MAX = 8.0
 
 _TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# 課金フィールドが壊れていた場合の共通メッセージ。coordinator はこれを
+# 捕捉して警告し、直前の値 (または設定値) を保持する。
+_UNEXPECTED = "Unexpected surcharges response structure"
+
+# _pick_active のソート用センチネル (境界なし = validFrom は最小 / validTo は最大)
+_DT_MIN = datetime.min.replace(tzinfo=UTC)
+_DT_MAX = datetime.max.replace(tzinfo=UTC)
 
 
 class _RetryableRequestError(Exception):
@@ -201,30 +209,47 @@ query tariff($gridOperatorCode: String!, $productCode: String) {
 """
 
 # 契約(agreement)の商品から基本料金・燃料費調整額・再エネ賦課金を取得する。
-# product は union 型 (段階制 / 単一単価 / FIT)。FIT には料金項目がない。
+# product は union 型 (段階制 / 単一単価 / FIT / ガス) で、料金項目を持つのは
+# ProductInterface を実装する ElectricitySingleStepProduct /
+# ElectricitySteppedProduct だけ。FIT とガスには料金項目がない (code のみ)。
+# フィールド名は OEJP Kraken スキーマに厳密に従うこと。誤った名前は
+# "Cannot query field" で実行時に落ちるため、mock のテストだけでは気付けない
+# (test_surcharges_query_uses_real_schema_field_names が名前を固定し、
+#  test_get_surcharges_field_error_raises_api_error が検出を保証する)。
 SURCHARGE_FIELDS = """
-  standingChargePricePerDay
-  fuelCostAdjustment { pricePerUnitIncTax validFrom validTo }
-  renewableEnergyLevy { pricePerUnitIncTax validFrom validTo }
-"""
+              fuelCostAdjustment {
+                validFrom validTo pricePerUnit pricePerUnitIncTax unitType
+              }
+              renewableEnergyLevy {
+                validFrom validTo pricePerUnit pricePerUnitIncTax unitType
+              }
+              standingChargePricePerDay
+              standingChargeUnitType
+              standingCharges { pricePerUnitIncTax validFrom validTo }"""
 
+# 契約は account → properties → electricitySupplyPoints → agreements の下にあり、
+# ルートに surcharges というフィールドは存在しない (operation 名だけ Surcharges)。
 SURCHARGES_QUERY = (
     """
-query surcharges($accountNumber: String!) {
+query Surcharges($accountNumber: String!) {
   account(accountNumber: $accountNumber) {
     properties {
       electricitySupplyPoints {
-        agreements {
+        agreements(onlyActive: true) {
           validFrom
           validTo
           product {
             __typename
-            ... on ElectricitySteppedProduct {"""
-    + SURCHARGE_FIELDS
-    + """}
             ... on ElectricitySingleStepProduct {"""
     + SURCHARGE_FIELDS
-    + """}
+    + """
+            }
+            ... on ElectricitySteppedProduct {"""
+    + SURCHARGE_FIELDS
+    + """
+            }
+            ... on ElectricityFitProduct { code displayName }
+            ... on GasTieredProduct { code }
           }
         }
       }
@@ -265,7 +290,7 @@ def _parse_api_datetime(value: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -278,32 +303,121 @@ def _is_active(item: dict[str, Any], now: datetime) -> bool:
     return valid_to is None or valid_to > now
 
 
+def _start_key(item: dict[str, Any]) -> datetime:
+    """Sort key for validFrom; a missing bound sorts before every real date."""
+    return _parse_api_datetime(item.get("validFrom")) or _DT_MIN
+
+
+def _end_key(item: dict[str, Any]) -> datetime:
+    """Sort key for validTo; a missing bound sorts after every real date."""
+    return _parse_api_datetime(item.get("validTo")) or _DT_MAX
+
+
 def _pick_active(items: Any, now: datetime) -> dict[str, Any] | None:
-    """Pick the currently valid entry from a dict or list of dicts."""
+    """Pick the entry that applies at ``now`` from a dict or a list of dicts.
+
+    Preference order (rates are dated, so "most recent" beats "arbitrary"):
+    1. among the entries whose [validFrom, validTo) contains ``now``, the
+       most recently started one: a newer agreement supersedes an older
+       open-ended one (an expired/undated entry never shadows it);
+    2. otherwise the started entry with the LATEST validFrom (the most
+       recent one that has begun), never an arbitrary older expired one;
+    3. otherwise (nothing has started yet) the EARLIEST future entry.
+    Ties prefer the entry with the latest validTo (open-ended last), then
+    the first in input order. Non-dict junk is ignored; no candidates at
+    all returns None.
+    """
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
         return None
     candidates = [item for item in items if isinstance(item, dict)]
-    for item in candidates:
-        if _is_active(item, now):
-            return item
-    # 期間外しかない場合は validTo 無しの最新を優先し、無ければ末尾
-    for item in reversed(candidates):
-        if item.get("validTo") is None:
-            return item
-    return candidates[-1] if candidates else None
+    if not candidates:
+        return None
+    active = [item for item in candidates if _is_active(item, now)]
+    if active:
+        return max(active, key=lambda item: (_start_key(item), _end_key(item)))
+    started = [item for item in candidates if _start_key(item) <= now]
+    if started:
+        chosen = max(started, key=lambda item: (_start_key(item), _end_key(item)))
+        _LOGGER.warning(
+            "No entry is valid at %s; using the most recent expired one "
+            "(validFrom=%s, validTo=%s)",
+            now,
+            chosen.get("validFrom"),
+            chosen.get("validTo"),
+        )
+        return chosen
+    earliest = min(candidates, key=_start_key)
+    chosen = max(
+        [item for item in candidates if _start_key(item) == _start_key(earliest)],
+        key=_end_key,
+    )
+    _LOGGER.warning(
+        "Nothing is valid at %s (the entry has not started yet); using the "
+        "earliest future entry (validFrom=%s)",
+        now,
+        chosen.get("validFrom"),
+    )
+    return chosen
 
 
-def _price(item: dict[str, Any] | None) -> float | None:
-    """Return pricePerUnitIncTax as float, or None when missing/invalid."""
-    if not isinstance(item, dict):
+def _coerce_price(value: Any, field: str) -> float | None:
+    """Return a finite float for a charge value, or None when absent.
+
+    Accepts Decimal-able strings and int/float, including negatives (the
+    fuel cost adjustment is legitimately negative at times). ``None`` means
+    the API did not provide the field. Anything present but unusable
+    (non-numeric or inf/nan string, bool, wrong type) raises
+    OctopusApiError: the coordinator then keeps its previous surcharges
+    instead of silently zeroing them.
+    """
+    if value is None:
         return None
-    try:
-        num = float(item.get("pricePerUnitIncTax"))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
+        # float(True) == 1.0 would pass a naive check; a bool is garbage here.
+        raise OctopusApiError(f"{_UNEXPECTED} ({field})")
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except ValueError:
+            raise OctopusApiError(f"{_UNEXPECTED} ({field})") from None
+    else:
+        raise OctopusApiError(f"{_UNEXPECTED} ({field})")
+    if not math.isfinite(num):
+        raise OctopusApiError(f"{_UNEXPECTED} ({field})")
+    return num
+
+
+def _select_charge_field(
+    container: Any, now: datetime, field: str
+) -> dict[str, Any] | None:
+    """Return the applicable entry of a nested charge field.
+
+    ``fuelCostAdjustment`` / ``renewableEnergyLevy`` normalize to a list but
+    tolerate a bare object. ``None`` means the field is absent; anything
+    present that is not an object or list of objects is garbage and raises.
+    """
+    if container is None:
         return None
-    return num if math.isfinite(num) else None
+    if isinstance(container, dict):
+        candidates: list[Any] = [container]
+    elif isinstance(container, list):
+        candidates = container
+    else:
+        raise OctopusApiError(f"{_UNEXPECTED} ({field})")
+    if any(item is not None and not isinstance(item, dict) for item in candidates):
+        raise OctopusApiError(f"{_UNEXPECTED} ({field})")
+    return _pick_active([item for item in candidates if isinstance(item, dict)], now)
+
+
+def _price_of(entry: dict[str, Any] | None, field: str) -> float | None:
+    """Return the tax-included price of a selected charge entry."""
+    if entry is None:
+        return None
+    return _coerce_price(entry.get("pricePerUnitIncTax"), f"{field}.pricePerUnitIncTax")
 
 
 class OctopusApiError(Exception):
@@ -582,30 +696,55 @@ class OctopusEnergyJpApiClient:
 
         Keys: ``standing_charge_per_day`` (JPY/day), ``fuel_per_kwh`` and
         ``levy_per_kwh`` (JPY/kWh, tax included). A value is None when the
-        API does not provide it (e.g. FIT products).
+        API does not provide it (e.g. FIT/Gas products, which have no charge
+        fields). Malformed payloads raise OctopusApiError rather than
+        returning a silent 0.0, so the caller keeps its previous values.
+
+        ``standing_charge_per_day`` is taken verbatim from
+        ``standingChargePricePerDay`` (already a per-day amount). The raw
+        ``standingCharges`` rows are per ampere per day and are never used to
+        derive it: without knowing the amperage that would silently corrupt
+        the daily basic charge.
         """
         data = await self._async_query(
             SURCHARGES_QUERY, {"accountNumber": account_number}
         )
         account = data.get("account")
         if not isinstance(account, dict):
-            raise OctopusApiError("Unexpected surcharges response structure")
+            raise OctopusApiError(_UNEXPECTED)
         supply_point = self._first_supply_point(account, "surcharges")
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         agreement = _pick_active(supply_point.get("agreements"), now)
         product = agreement.get("product") if isinstance(agreement, dict) else None
         if not isinstance(product, dict):
             raise OctopusApiError("No active agreement product found")
-        try:
-            standing = float(product.get("standingChargePricePerDay"))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            standing = None
+        standing = _coerce_price(
+            product.get("standingChargePricePerDay"), "standingChargePricePerDay"
+        )
+        unit_type = product.get("standingChargeUnitType")
+        if standing is None and product.get("standingCharges"):
+            _LOGGER.debug(
+                "standingChargePricePerDay is missing while standingCharges rows "
+                "are present (standingChargeUnitType=%s); per-ampere rows are not "
+                "converted into a per-day charge",
+                unit_type,
+            )
+        elif standing is not None and unit_type not in (None, "DAYS_ON_SUPPLY"):
+            _LOGGER.debug(
+                "standingChargeUnitType=%s while standingChargePricePerDay is used "
+                "as-is",
+                unit_type,
+            )
+        fuel = _select_charge_field(
+            product.get("fuelCostAdjustment"), now, "fuelCostAdjustment"
+        )
+        levy = _select_charge_field(
+            product.get("renewableEnergyLevy"), now, "renewableEnergyLevy"
+        )
         return {
-            "standing_charge_per_day": standing
-            if standing is not None and math.isfinite(standing)
-            else None,
-            "fuel_per_kwh": _price(_pick_active(product.get("fuelCostAdjustment"), now)),
-            "levy_per_kwh": _price(_pick_active(product.get("renewableEnergyLevy"), now)),
+            "standing_charge_per_day": standing,
+            "fuel_per_kwh": _price_of(fuel, "fuelCostAdjustment"),
+            "levy_per_kwh": _price_of(levy, "renewableEnergyLevy"),
         }
 
     async def async_get_tariff_rates(

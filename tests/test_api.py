@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
@@ -11,11 +12,14 @@ import pytest
 
 from custom_components.octopus_energy_jp.api import (
     RETRY_MAX_DELAY,
+    SURCHARGES_QUERY,
     OctopusApiError,
     OctopusAuthError,
     OctopusEnergyJpApiClient,
     _has_auth_error_code,
     _is_auth_error,
+    _parse_api_datetime,
+    _pick_active,
 )
 
 EMAIL = "user@example.com"
@@ -738,6 +742,451 @@ async def test_get_readings_rejects_bad_payloads(data: dict) -> None:
         await client.async_get_readings(
             "A-1", datetime(2024, 5, 1), datetime(2024, 5, 2)
         )
+
+
+NOW = datetime(2026, 10, 8, 3, 0, tzinfo=UTC)
+
+# The module logger the surcharge parser warns on (caplog filter).
+API_LOGGER = "custom_components.octopus_energy_jp.api"
+
+
+def test_surcharges_query_uses_real_schema_field_names() -> None:
+    """The document must match the OEJP schema and stay lean.
+
+    A wrong field name only fails against the real API ("Cannot query field"),
+    so the shape is pinned here instead of relying on mocked responses.
+    """
+    assert "query surcharges($accountNumber: String!)" in SURCHARGES_QUERY
+    # There is no root-level ``surcharges`` field: the agreement data lives
+    # under the account tree.
+    assert "\n  surcharges" not in SURCHARGES_QUERY
+    for name in (
+        "account(accountNumber: $accountNumber)",
+        "properties {",
+        "electricitySupplyPoints {",
+        "agreements {",
+        "validFrom",
+        "validTo",
+        "product {",
+        "__typename",
+        "... on ElectricitySingleStepProduct",
+        "... on ElectricitySteppedProduct",
+        "... on ElectricityFitProduct { displayName }",
+        "... on GasTieredProduct { displayName }",
+        "standingChargePricePerDay",
+        "fuelCostAdjustment { pricePerUnitIncTax validFrom validTo }",
+        "renewableEnergyLevy { pricePerUnitIncTax validFrom validTo }",
+    ):
+        assert name in SURCHARGES_QUERY
+    # Both charge-bearing fragments request the same real field names.
+    assert SURCHARGES_QUERY.count("fuelCostAdjustment {") == 2
+    assert SURCHARGES_QUERY.count("renewableEnergyLevy {") == 2
+    for absent in (
+        "onlyActive",  # agreement selection stays local (_pick_active)
+        "fuelAdjustment",
+        "renewableLevy",
+        "basicCharge",
+        "fuelGrossCost",
+        "standingCharges",  # per-ampere rows are never requested or scaled
+        "standingChargeUnitType",
+        "unitType",
+    ):
+        assert absent not in SURCHARGES_QUERY
+
+
+async def test_get_surcharges_field_error_raises_api_error() -> None:
+    """A GraphQL validation error must fail loudly, never silently return 0.0."""
+    payload = {
+        "errors": [
+            {
+                "message": (
+                    "Cannot query field 'fuelAdjustment' on type "
+                    "'ElectricitySteppedProduct'."
+                ),
+                "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+            }
+        ]
+    }
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(
+                _ok_response(payload={"data": {"obtainKrakenToken": {"token": "tok"}}})
+            ),
+            _context_manager_for(_ok_response(payload=payload)),
+        ]
+    )
+    with pytest.raises(OctopusApiError) as exc_info:
+        await client.async_get_surcharges("A-1", now=NOW)
+    assert not isinstance(exc_info.value, OctopusAuthError)
+    assert "Cannot query field" in str(exc_info.value)
+    sent = session.post.call_args.kwargs["json"]["query"]
+    assert sent == SURCHARGES_QUERY
+    assert "fuelAdjustment" not in sent
+
+
+def _surcharges_payload(agreements: list) -> dict:
+    """Response path as the schema returns it: account → properties →
+    electricitySupplyPoints → agreements → product."""
+    return {
+        "account": {
+            "properties": [{"electricitySupplyPoints": [{"agreements": agreements}]}]
+        }
+    }
+
+
+def _stepped_product(
+    fuel: Any,
+    levy: Any,
+    standing: Any = "0.00",
+    typename: str = "ElectricitySteppedProduct",
+) -> dict:
+    """A charge-bearing product (ProductInterface) with its real field names."""
+    return {
+        "__typename": typename,
+        "standingChargePricePerDay": standing,
+        "fuelCostAdjustment": fuel,
+        "renewableEnergyLevy": levy,
+    }
+
+
+@pytest.mark.parametrize(
+    "typename",
+    ["ElectricitySteppedProduct", "ElectricitySingleStepProduct"],
+)
+async def test_get_surcharges_picks_active_agreement_and_rates(
+    typename: str,
+) -> None:
+    agreements = [
+        {
+            "validFrom": "2025-01-01T00:00:00+09:00",
+            "validTo": "2026-01-01T00:00:00+09:00",
+            "product": _stepped_product(
+                {"pricePerUnitIncTax": "9.99"},
+                {"pricePerUnitIncTax": "9.99"},
+                typename=typename,
+            ),
+        },
+        {
+            "validFrom": "2026-01-01T00:00:00+09:00",
+            "validTo": None,
+            "product": _stepped_product(
+                [
+                    {
+                        "pricePerUnitIncTax": "-1.50",
+                        "validFrom": "2026-09-01T00:00:00+09:00",
+                        "validTo": "2026-10-01T00:00:00+09:00",
+                    },
+                    {
+                        "pricePerUnitIncTax": "-1.20",
+                        "validFrom": "2026-10-01T00:00:00+09:00",
+                        "validTo": "2026-11-01T00:00:00+09:00",
+                    },
+                ],
+                {"pricePerUnitIncTax": "4.18", "validFrom": "2026-05-01"},
+                standing="295.24",
+                typename=typename,
+            ),
+        },
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": 295.24,
+        "fuel_per_kwh": -1.2,
+        "levy_per_kwh": 4.18,
+    }
+
+
+@pytest.mark.parametrize(
+    ("typename", "display_name"),
+    [
+        ("ElectricityFitProduct", "FIT sales"),
+        ("GasTieredProduct", "Gas Flex"),
+    ],
+)
+async def test_get_surcharges_non_electric_product_parses(
+    typename: str, display_name: str, caplog
+) -> None:
+    """FIT/Gas products parse to absent values (no crash, no zeros).
+
+    The name-only fragments let these union members be identified instead of
+    collapsing to an opaque product.
+    """
+    agreements = [
+        {
+            "validFrom": None,
+            "validTo": None,
+            "product": {"__typename": typename, "displayName": display_name},
+        }
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    with caplog.at_level("DEBUG", logger=API_LOGGER):
+        result = await client.async_get_surcharges("A-1", now=NOW)
+    assert result == {
+        "standing_charge_per_day": None,
+        "fuel_per_kwh": None,
+        "levy_per_kwh": None,
+    }
+    assert any(display_name in record.getMessage() for record in caplog.records)
+
+
+async def test_get_surcharges_newer_agreement_supersedes_null_product() -> None:
+    """An older open agreement without a product must not shadow the current one."""
+    agreements = [
+        {"validFrom": "2025-01-01", "validTo": None, "product": None},
+        {
+            "validFrom": "2026-01-01",
+            "validTo": None,
+            "product": {
+                "__typename": "ElectricityFitProduct",
+                "displayName": "FIT product",
+            },
+        },
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": None,
+        "fuel_per_kwh": None,
+        "levy_per_kwh": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("standing", "expected"),
+    [
+        ("295.24", 295.24),
+        ("  41.6  ", 41.6),
+        (295, 295.0),
+        (295.24, 295.24),
+        ("-12.5", -12.5),
+        ("0", 0.0),
+        (None, None),
+    ],
+)
+async def test_get_surcharges_accepts_decimal_able_values(
+    standing: Any, expected: float | None
+) -> None:
+    agreements = [
+        {
+            "product": _stepped_product(
+                {"pricePerUnitIncTax": "-1.2"},
+                {"pricePerUnitIncTax": "4.18"},
+                standing=standing,
+            )
+        }
+    ]
+    client = _client_with_query(_surcharges_payload(agreements))
+    result = await client.async_get_surcharges("A-1", now=NOW)
+    assert result["standing_charge_per_day"] == expected
+    # A negative fuel adjustment is legitimate and must survive parsing.
+    assert result["fuel_per_kwh"] == -1.2
+    assert result["levy_per_kwh"] == 4.18
+
+
+@pytest.mark.parametrize(
+    ("fuel", "levy", "standing"),
+    [
+        ({"pricePerUnitIncTax": "NaN"}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": "nan"}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": "-inf"}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": "abc"}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": True}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": ["1.0"]}, {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        ({"pricePerUnitIncTax": "1.0"}, {"pricePerUnitIncTax": "abc"}, "295.24"),
+        ({"pricePerUnitIncTax": "1.0"}, {"pricePerUnitIncTax": False}, "295.24"),
+        ({"pricePerUnitIncTax": "1.0"}, {"pricePerUnitIncTax": "4.18"}, "inf"),
+        ({"pricePerUnitIncTax": "1.0"}, {"pricePerUnitIncTax": "4.18"}, True),
+        (
+            {"pricePerUnitIncTax": "1.0"},
+            {"pricePerUnitIncTax": "4.18"},
+            {"pricePerUnitIncTax": "9.99"},
+        ),
+        ("junk", {"pricePerUnitIncTax": "4.18"}, "295.24"),
+        (["junk"], {"pricePerUnitIncTax": "4.18"}, "295.24"),
+    ],
+)
+async def test_get_surcharges_rejects_field_level_garbage(
+    fuel: Any, levy: Any, standing: Any
+) -> None:
+    """Garbage charge fields raise so the coordinator keeps previous values.
+
+    Silently zeroing a surcharge hides a broken field name from operators.
+    """
+    agreements = [{"product": _stepped_product(fuel, levy, standing=standing)}]
+    client = _client_with_query(_surcharges_payload(agreements))
+    with pytest.raises(OctopusApiError) as exc_info:
+        await client.async_get_surcharges("A-1", now=NOW)
+    assert "Unexpected surcharges response structure" in str(exc_info.value)
+
+
+async def test_get_surcharges_absent_charge_fields_stay_none() -> None:
+    """A product that resolved but carries no charge keys is not garbage."""
+    agreements = [{"product": {"__typename": "ElectricitySteppedProduct"}}]
+    client = _client_with_query(_surcharges_payload(agreements))
+    assert await client.async_get_surcharges("A-1", now=NOW) == {
+        "standing_charge_per_day": None,
+        "fuel_per_kwh": None,
+        "levy_per_kwh": None,
+    }
+
+
+async def test_get_surcharges_uses_per_day_standing_charge_verbatim() -> None:
+    """standingChargePricePerDay (JPY/day) is used as-is; no amperage math."""
+    product = _stepped_product(
+        {"pricePerUnitIncTax": "1.0"},
+        {"pricePerUnitIncTax": "4.18"},
+        standing="295.24",
+    )
+    # Raw per-ampere rows never reach the parser via the query, but if a
+    # response carries them they must not be converted into a daily charge.
+    product["standingChargeUnitType"] = "DAYS_ON_SUPPLY"
+    product["standingCharges"] = [
+        {"pricePerUnitIncTax": "9.85", "validFrom": "2026-01-01", "validTo": None},
+        {"pricePerUnitIncTax": "9.85", "validFrom": "2026-08-01", "validTo": None},
+    ]
+    client = _client_with_query(_surcharges_payload([{"product": product}]))
+    result = await client.async_get_surcharges("A-1", now=NOW)
+    assert result["standing_charge_per_day"] == 295.24
+    assert result["standing_charge_per_day"] != 9.85
+
+
+@pytest.mark.parametrize("unit_type", ["AMPERE_MONTHS", "DAYS_ON_SUPPLY", None])
+async def test_get_surcharges_per_ampere_rows_alone_do_not_substitute(
+    unit_type: str | None,
+) -> None:
+    """Without standingChargePricePerDay nothing is derived from the rows.
+
+    The raw ``standingCharges`` list is per ampere per day; deriving a daily
+    basic charge from it would need the amperage, so it stays None.
+    """
+    product = _stepped_product(
+        {"pricePerUnitIncTax": "1.0"},
+        {"pricePerUnitIncTax": "4.18"},
+        standing=None,
+    )
+    product["standingChargeUnitType"] = unit_type
+    product["standingCharges"] = [
+        {"pricePerUnitIncTax": "9.85", "validFrom": "2026-01-01"},
+        {"pricePerUnitIncTax": "9.85", "validFrom": "2026-08-01"},
+    ]
+    client = _client_with_query(_surcharges_payload([{"product": product}]))
+    result = await client.async_get_surcharges("A-1", now=NOW)
+    assert result["standing_charge_per_day"] is None
+    assert result["fuel_per_kwh"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"account": None},
+        {"account": {"properties": []}},
+        _surcharges_payload([]),
+        _surcharges_payload([{"validFrom": None, "product": None}]),
+    ],
+)
+async def test_get_surcharges_rejects_bad_payloads(data: dict) -> None:
+    client = _client_with_query(data)
+    with pytest.raises(OctopusApiError):
+        await client.async_get_surcharges("A-1", now=NOW)
+
+
+def test_pick_active_prefers_entry_valid_now() -> None:
+    expired = {"validFrom": "2025-01-01", "validTo": "2025-06-01", "id": "expired"}
+    active = {"validFrom": "2026-01-01", "validTo": "2027-01-01", "id": "active"}
+    future = {"validFrom": "2030-01-01", "validTo": None, "id": "future"}
+    assert _pick_active([expired, future, active], NOW) is active
+    assert _pick_active([future, active, expired], NOW) is active
+    # A bare object (single-entry field) is handled the same way.
+    assert _pick_active(active, NOW) is active
+
+
+def test_pick_active_multiple_active_picks_most_recent() -> None:
+    """A newer agreement supersedes an older open-ended one."""
+    older_open = {"validFrom": "2020-01-01", "validTo": None, "id": "older-open"}
+    newer = {
+        "validFrom": "2026-09-10T09:00:00+09:00",
+        "validTo": "2027-10-10T09:00:00+09:00",
+        "id": "newer",
+    }
+    assert _pick_active([older_open, newer], NOW) is newer
+    assert _pick_active([newer, older_open], NOW) is newer
+
+
+def test_pick_active_open_bounds_count_as_active() -> None:
+    open_both = {"validFrom": None, "validTo": None}
+    assert _pick_active([open_both], NOW) is open_both
+    open_end = {"validFrom": "2026-01-01", "validTo": None}
+    assert _pick_active([open_end], NOW) is open_end
+
+
+def test_pick_active_only_expired_picks_most_recent(caplog) -> None:
+    older = {"validFrom": "2024-01-01", "validTo": "2024-06-01", "id": "older"}
+    newer = {"validFrom": "2025-06-01", "validTo": "2025-07-01", "id": "newer"}
+    with caplog.at_level("WARNING", logger=API_LOGGER):
+        assert _pick_active([newer, older], NOW) is newer
+    assert any(
+        "most recent expired" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_pick_active_only_future_picks_earliest_and_warns(caplog) -> None:
+    later = {"validFrom": "2031-01-01", "validTo": None, "id": "later"}
+    sooner = {"validFrom": "2030-01-01", "validTo": None, "id": "sooner"}
+    with caplog.at_level("WARNING", logger=API_LOGGER):
+        assert _pick_active([later, sooner], NOW) is sooner
+    assert any(
+        "has not started yet" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_pick_active_mixed_expired_and_future_prefers_expired(caplog) -> None:
+    """An expired rate beats a not-yet-started one (previous bug: future won)."""
+    expired = {"validFrom": "2025-01-01", "validTo": "2025-02-01", "id": "expired"}
+    future = {"validFrom": "2030-01-01", "validTo": None, "id": "future"}
+    with caplog.at_level("WARNING", logger=API_LOGGER):
+        assert _pick_active([future, expired], NOW) is expired
+    assert not any(
+        "has not started yet" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_pick_active_expired_ignores_undated_entry() -> None:
+    """An undated (unknown start) entry never outranks a dated expired one."""
+    dated = {"validFrom": "2025-01-01", "validTo": "2025-02-01", "id": "dated"}
+    undated = {"validFrom": None, "validTo": "2025-03-01", "id": "undated"}
+    assert _pick_active([undated, dated], NOW) is dated
+    assert _pick_active([undated], NOW) is undated
+
+
+def test_pick_active_tie_break_prefers_latest_valid_to() -> None:
+    closed = {"validFrom": "2025-01-01", "validTo": "2025-02-01", "id": "closed"}
+    open_ended = {"validFrom": "2025-01-01", "validTo": None, "id": "open"}
+    assert _pick_active([closed, open_ended], NOW) is open_ended
+    assert _pick_active([open_ended, closed], NOW) is open_ended
+
+
+def test_pick_active_full_tie_is_input_order_stable() -> None:
+    first = {"validFrom": "2030-01-01", "validTo": None, "id": "first"}
+    second = {"validFrom": "2030-01-01", "validTo": None, "id": "second"}
+    assert _pick_active([first, second], NOW) is first
+    assert _pick_active([second, first], NOW) is second
+
+
+def test_pick_active_ignores_junk_and_handles_empty() -> None:
+    assert _pick_active(["junk"], NOW) is None
+    assert _pick_active([], NOW) is None
+    assert _pick_active(None, NOW) is None
+    assert _pick_active("nope", NOW) is None
+    entry = {"validFrom": "2025-01-01", "validTo": "2025-02-01", "id": "ok"}
+    assert _pick_active(["junk", entry], NOW) is entry
+
+
+def test_parse_api_datetime_variants() -> None:
+    assert _parse_api_datetime("2026-10-01") == datetime(2026, 10, 1, tzinfo=UTC)
+    assert _parse_api_datetime("2026-10-01T00:00:00Z") == datetime(
+        2026, 10, 1, tzinfo=UTC
+    )
+    assert _parse_api_datetime("not-a-date") is None
+    assert _parse_api_datetime(None) is None
 
 
 def _bills_payload() -> dict:

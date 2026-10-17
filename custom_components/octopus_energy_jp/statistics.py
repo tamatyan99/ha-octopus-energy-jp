@@ -39,6 +39,25 @@ class OctopusStatisticsImporter:
     multi-month history feature), a full re-import is triggered once so the
     older hours are backfilled with a consistent cumulative sum.
 
+    Hours still inside the fetch window are stored individually. A revised
+    reading or a new tariff updates those hours and the running sum after
+    them. Hours that have scrolled out of the window stay in ``_prefix_sum``
+    and are not restarted at 0. An hour that scrolled off and is delivered
+    again (a failed fetch chunk that a later poll brings back) is recognised as
+    already inside ``_prefix_sum`` and is not imported a second time: counting
+    it again would add one phantom hour per failed chunk, for good.
+
+    Migration intent: a store written by v0.4.1 has no hour map, but its
+    ``cumulative`` is by definition the total of every hour up to
+    ``last_start``. Such a store must not silently stay on the append-only path
+    forever, so it is loaded as an empty window whose prefix is that cumulative
+    and the first import after the upgrade rebuilds the window from the payload
+    with absolute sums anchored on the stored cumulative (revising overlap
+    hours on the way) and persists the new shape, which turns the bucketed path
+    on for good. A store whose hour map is unusable is kept on the append-only
+    path, and a baseline recovered from the recorder has no hour values to
+    recover.
+
     正規ルートでは coordinator.account_number を account_number 引数に渡す
     こと。各 config entry が自分専用の statistic_id を持つため、複数契約の
     統計が互いを上書きしない。
@@ -78,6 +97,10 @@ class OctopusStatisticsImporter:
         self._last_start: datetime | None = None
         self._earliest_start: datetime | None = None
         self._cumulative: float = 0.0
+        # None: per-hour values are unknown (legacy store or recorder recovery).
+        # dict: hours still in the fetch window. Older hours live in _prefix_sum.
+        self._prefix_sum: float = 0.0
+        self._buckets: dict[datetime, float] | None = {}
 
     async def _recover_baseline_from_recorder(self) -> None:
         """Seed import state from the recorder when the local store is gone.
@@ -139,11 +162,15 @@ class OctopusStatisticsImporter:
         # NOTE: the true earliest imported hour is unknown (only the last row
         # was queried), so seed a sentinel old enough that the "fetch window
         # widened into the past" full re-import branch in async_import never
-        # fires on the recovered path. A from-0 full re-import over the ~1
-        # month API window would overwrite recorder rows that continue an
-        # older cumulative sum; only strictly newer buckets are imported.
+        # fires on the recovered path. A from-0 full re-import over the ~3
+        # month API window (≈2160 hourly rows, ≈121 KB of hour map per series
+        # per import) would overwrite recorder rows that continue an older
+        # cumulative sum; only strictly newer buckets are imported.
+        # Per-hour values are also unknown, so keep the legacy append-only path.
         self._earliest_start = dt_util.as_local(_RECOVERY_EARLIEST_UTC)
         self._cumulative = baseline
+        self._prefix_sum = 0.0
+        self._buckets = None
         _LOGGER.warning(
             "Local statistics state was missing; recovered baseline from "
             "recorder (statistic_id=%s, sum=%s)",
@@ -191,11 +218,94 @@ class OctopusStatisticsImporter:
         if not math.isfinite(cumulative):
             cumulative = 0.0
         self._cumulative = cumulative
+        if "buckets" not in data:
+            # v0.4.1 shape: no hour map, but ``cumulative`` is the total of
+            # every hour up to last_start, which is exactly the prefix in front
+            # of a window whose hours are still unknown. Seeding it upgrades
+            # the store on the next import instead of leaving the bucketed path
+            # inert forever (see _anchored_window).
+            self._buckets = {}
+            self._prefix_sum = cumulative
+            _LOGGER.info(
+                "Statistics state has no hour map; upgrading it from the stored "
+                "cumulative (statistic_id=%s, cumulative=%s)",
+                self._statistic_id,
+                cumulative,
+            )
+        else:
+            self._buckets = self._restore_buckets(data)
+            if self._buckets is None:
+                # Unusable hour map: stay on the append-only path rather than
+                # rewriting sums from a map that cannot be trusted.
+                self._prefix_sum = 0.0
+            else:
+                try:
+                    prefix_sum = float(data.get("prefix_sum", 0.0))
+                except (TypeError, ValueError):
+                    prefix_sum = 0.0
+                if not math.isfinite(prefix_sum):
+                    prefix_sum = 0.0
+                bucket_total = prefix_sum + sum(self._buckets.values())
+                if abs(bucket_total - self._cumulative) > 1e-3:
+                    _LOGGER.warning(
+                        "Ignoring statistics hour map that does not match the "
+                        "stored cumulative (statistic_id=%s, prefix_sum=%s, "
+                        "hours total=%s, cumulative=%s); falling back to the "
+                        "append-only path",
+                        self._statistic_id,
+                        prefix_sum,
+                        bucket_total - prefix_sum,
+                        self._cumulative,
+                    )
+                    self._buckets = None
+                    self._prefix_sum = 0.0
+                else:
+                    self._prefix_sum = prefix_sum
 
-    async def async_import(self, hourly: list[dict[str, Any]]) -> None:
-        """Import newly settled hours from coordinator data."""
+    def _restore_buckets(self, data: dict[str, Any]) -> dict[datetime, float] | None:
+        """Return the persisted hour map, or None when it cannot be trusted.
+
+        Every rejection is logged with the part that failed: returning None
+        silently would disable in-window revisions for the lifetime of the
+        store with nothing in the log to explain it.
+        """
+        raw_buckets = data.get("buckets")
+        if not isinstance(raw_buckets, list):
+            _LOGGER.warning(
+                "Ignoring statistics hour map (statistic_id=%s): expected a "
+                "list, got %s",
+                self._statistic_id,
+                type(raw_buckets).__name__,
+            )
+            return None
+        restored: dict[datetime, float] = {}
+        for index, item in enumerate(raw_buckets):
+            start: datetime | None = None
+            value: float | None = None
+            if isinstance(item, dict):
+                raw_start = item.get("start")
+                if isinstance(raw_start, str):
+                    start = dt_util.parse_datetime(raw_start)
+                try:
+                    value = float(item.get("value"))
+                except (TypeError, ValueError):
+                    value = None
+            if start is None or value is None or not math.isfinite(value):
+                _LOGGER.warning(
+                    "Ignoring statistics hour map (statistic_id=%s): entry %d "
+                    "has no usable start/value (%r)",
+                    self._statistic_id,
+                    index,
+                    item,
+                )
+                return None
+            restored[dt_util.as_local(start)] = value
+        return restored
+
+    def _collect_settled(self, hourly: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return settled hour rows sorted by local start."""
         if not isinstance(hourly, list):
-            return
+            return []
         value_key = self._value_key
         now = dt_util.now()
         settled: list[dict[str, Any]] = []
@@ -217,72 +327,57 @@ class OctopusStatisticsImporter:
                 continue
             if start_local + timedelta(hours=1) <= now - STATS_IMPORT_BUFFER:
                 settled.append({"start": start_local, value_key: amount})
-        if not settled:
-            return
-        settled.sort(key=lambda s: s["start"])
+        settled.sort(key=lambda row: row["start"])
+        return settled
 
-        if (
-            self._last_start is None
-            or self._earliest_start is None
-            or settled[0]["start"] < self._earliest_start
-        ):
-            # 初回、または取得範囲が過去に拡大された場合は全件再投入（上書きで冪等）
-            cumulative = 0.0
-            targets = settled
-            self._earliest_start = settled[0]["start"]
-        else:
-            cumulative = self._cumulative
-            overlap = [s for s in settled if s["start"] <= self._last_start]
-            targets = [s for s in settled if s["start"] > self._last_start]
-            if overlap and settled[0]["start"] == self._earliest_start:
-                # 訂正追従: fresh_total は現ウィンドウ内の合計、_cumulative は
-                # ウィンドウより古い prefix を含む生涯累積。settled[0] ==
-                # _earliest_start のときだけ prefix==0 で比較が成立する。月次で
-                # ウィンドウが進み settled[0] > earliest になったら不一致は常に
-                # prefix 分であり訂正ではない。ここを緩めて再ベースすると累積が
-                # 0 付近に潰れ Energy Dashboard が壊れる（+1.0 が -71.0 等）。
-                # 古いバケットの訂正追従にはバケット単位の永続化が必要（本リリース外）。
-                fresh_total = sum(s[value_key] for s in settled)
-                expected = cumulative + sum(s[value_key] for s in targets)
-                if abs(fresh_total - expected) > 1e-6:
-                    _LOGGER.debug("Detected revised past readings; re-importing all")
-                    cumulative = 0.0
-                    targets = settled
+    def _collapse_hours(self, settled: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep the last value when one batch contains the same hour twice."""
+        value_key = self._value_key
+        values: dict[datetime, float] = {}
+        order: list[datetime] = []
+        for item in settled:
+            start = item["start"]
+            if start not in values:
+                order.append(start)
+            values[start] = item[value_key]
+        return [{"start": start, value_key: values[start]} for start in order]
 
-        if not targets:
-            return
+    def _points_for(
+        self,
+        buckets: dict[datetime, float],
+        starts: list[datetime],
+        base: float,
+    ) -> list[StatisticData]:
+        """Build statistic rows for ``starts``, each with its absolute sum.
 
+        ``base`` is the prefix — the total of the hours in front of the map —
+        and the sum of each emitted row is then walked out of the map instead of
+        being offset per row, so every row carries the total it would have if all
+        earlier hours had been written. A gap in the emitted set (a re-delivered
+        old hour, a failed chunk) therefore cannot shift the sums of the rows
+        around it — which is how a re-delivered hour used to be counted twice.
+        """
+        wanted = set(starts)
+        running = base
         points: list[StatisticData] = []
-        for item in targets:
-            delta = item[value_key]
-            cumulative += delta
+        for start in sorted(buckets):
+            delta = buckets[start]
+            running += delta
+            if start not in wanted:
+                continue
             point: StatisticData = {
-                "start": dt_util.as_utc(item["start"]),
-                "sum": round(cumulative, 3),
+                "start": dt_util.as_utc(start),
+                "sum": round(running, 3),
             }
-            # Cost series carries interval deltas for the Energy Dashboard;
-            # consumption rows stay start+sum only so existing data is not rewritten.
             if self._include_state:
                 point["state"] = round(delta, 3)
             points.append(point)
+        return points
 
-        assert points, "targets non-empty implies at least one statistic point"
-
-        metadata: StatisticMetaData = {
-            "mean_type": StatisticMeanType.NONE,
-            "has_sum": True,
-            "name": self._statistic_name,
-            "source": DOMAIN,
-            "statistic_id": self._statistic_id,
-            "unit_class": self._unit_class,
-            "unit_of_measurement": self._unit_of_measurement,
-        }
-        async_add_external_statistics(self._hass, metadata, points)
-        self._last_start = targets[-1]["start"]
-        if self._earliest_start is None:
-            self._earliest_start = targets[0]["start"]
-        self._cumulative = cumulative
-        assert self._last_start is not None
+    async def _async_persist(self) -> None:
+        """Save import cursors and, when known, the in-window hour values."""
+        if self._last_start is None:
+            return
         earliest = self._earliest_start
         payload: dict[str, Any] = {
             "last_start": self._last_start.isoformat(),
@@ -293,9 +388,226 @@ class OctopusStatisticsImporter:
             ),
             "cumulative": self._cumulative,
         }
+        if self._buckets is not None:
+            payload["prefix_sum"] = self._prefix_sum
+            payload["buckets"] = [
+                {"start": start.isoformat(), "value": value}
+                for start, value in sorted(self._buckets.items())
+            ]
         try:
             await self._store.async_save(payload)
         except Exception as err:  # noqa: BLE001 - persistence must not fail import
             _LOGGER.warning("Failed to save statistics state: %s", err)
             return
+        _LOGGER.debug("Saved statistics state")
+
+    def _metadata(self) -> StatisticMetaData:
+        return {
+            "mean_type": StatisticMeanType.NONE,
+            "has_sum": True,
+            "name": self._statistic_name,
+            "source": DOMAIN,
+            "statistic_id": self._statistic_id,
+            "unit_class": self._unit_class,
+            "unit_of_measurement": self._unit_of_measurement,
+        }
+
+    async def async_import(self, hourly: list[dict[str, Any]]) -> None:
+        """Import newly settled hours from coordinator data."""
+        settled = self._collect_settled(hourly)
+        if not settled:
+            return
+        if self._buckets is None:
+            await self._async_import_legacy(settled)
+            return
+        await self._async_import_bucketed(settled)
+
+    async def _async_import_legacy(self, settled: list[dict[str, Any]]) -> None:
+        """Append-only import used when per-hour values were not stored.
+
+        A recovered recorder baseline has no hour map. Restarting its sum at 0
+        would erase the prefix that is already in the dashboard.
+        """
+        value_key = self._value_key
+        if (
+            self._last_start is None
+            or self._earliest_start is None
+            or settled[0]["start"] < self._earliest_start
+        ):
+            cumulative = 0.0
+            targets = settled
+            self._earliest_start = settled[0]["start"]
+        else:
+            cumulative = self._cumulative
+            overlap = [row for row in settled if row["start"] <= self._last_start]
+            targets = [row for row in settled if row["start"] > self._last_start]
+            if overlap and settled[0]["start"] == self._earliest_start:
+                fresh_total = sum(row[value_key] for row in settled)
+                expected = cumulative + sum(row[value_key] for row in targets)
+                if abs(fresh_total - expected) > 1e-6:
+                    _LOGGER.debug("Detected revised past readings; re-importing all")
+                    cumulative = 0.0
+                    targets = settled
+        if not targets:
+            return
+        points: list[StatisticData] = []
+        for item in targets:
+            delta = item[value_key]
+            cumulative += delta
+            point: StatisticData = {
+                "start": dt_util.as_utc(item["start"]),
+                "sum": round(cumulative, 3),
+            }
+            if self._include_state:
+                point["state"] = round(delta, 3)
+            points.append(point)
+        async_add_external_statistics(self._hass, self._metadata(), points)
+        self._last_start = targets[-1]["start"]
+        if self._earliest_start is None:
+            self._earliest_start = targets[0]["start"]
+        self._cumulative = cumulative
+        await self._async_persist()
+        _LOGGER.debug("Imported %d statistics points", len(points))
+
+    def _anchored_window(
+        self,
+        rows: list[dict[str, Any]],
+        last_start: datetime,
+        earliest: datetime | None,
+    ) -> tuple[list[dict[str, Any]] | None, float]:
+        """Anchor a payload on the cumulative a store without an hour map holds.
+
+        A v0.4.1 store kept only ``cumulative`` = the total of every hour up to
+        ``last_start``. Walking the payload backwards from that anchor gives
+        every hour the absolute sum the recorder must end up with: the row at
+        ``last_start`` keeps the stored total while overlap hours are written
+        with their payload values, so a revision is picked up without
+        restarting the series. A revision inside the window shifts the hours in
+        front of it (a deliberate downward rewrite); shifting the hours after it
+        instead would break sums the recorder already holds.
+
+        Returns the rows to store plus the prefix, or ``(None, 0.0)`` when the
+        payload cannot be anchored — it starts before the earliest hour ever
+        accounted for, or it does not cover ``last_start`` continuously (a
+        failed chunk), in which case the base of those hours is not part of the
+        stored cumulative and the poll is skipped. A payload that starts after
+        the cursor is appended on that cumulative: the hours in between were
+        never delivered by the API, so they are not part of the stored total and
+        have no row to continue from.
+        """
+        window = [row for row in rows if row["start"] <= last_start]
+        if not window:
+            # Payload starts after the cursor: nothing to anchor, append on.
+            return rows, self._cumulative
+        first = window[0]["start"]
+        if earliest is not None and first < earliest:
+            _LOGGER.debug(
+                "Statistics payload reaches behind the earliest accounted hour "
+                "(statistic_id=%s, batch front=%s, earliest=%s); keeping the "
+                "stored prefix and skipping this poll",
+                self._statistic_id,
+                first,
+                earliest,
+            )
+            return None, 0.0
+        span = int((last_start - first).total_seconds() // 3600) + 1
+        if rows[-1]["start"] < last_start or len(window) != span:
+            _LOGGER.debug(
+                "Statistics payload does not cover the stored cursor "
+                "continuously (statistic_id=%s, batch front=%s, batch end=%s, "
+                "cursor=%s); skipping this poll",
+                self._statistic_id,
+                first,
+                rows[-1]["start"],
+                last_start,
+            )
+            return None, 0.0
+        window_total = sum(row[self._value_key] for row in window)
+        return rows, self._cumulative - window_total
+
+    async def _async_import_bucketed(self, settled: list[dict[str, Any]]) -> None:
+        """Import hours, revising in-window values without dropping the prefix.
+
+        ``_prefix_sum`` totals exactly the hours in front of ``_buckets``, so a
+        row's absolute sum is always the prefix plus the hours before it in the
+        map: nothing is restarted at 0 and nothing in front of the map's front
+        is written twice.
+        """
+        assert self._buckets is not None
+        rows = self._collapse_hours(settled)
+        value_key = self._value_key
+        earliest = self._earliest_start
+        last_start = self._last_start
+
+        if not self._buckets and last_start is not None:
+            # Migrated v0.4.1 store: no hour values were kept, only the total
+            # up to last_start. Rebuild the window on that anchor.
+            anchored, new_prefix = self._anchored_window(rows, last_start, earliest)
+            if anchored is None:
+                return
+            new_buckets = {row["start"]: row[value_key] for row in anchored}
+            front = anchored[0]["start"]
+            if earliest is None or front < earliest:
+                earliest = front
+            starts = [row["start"] for row in anchored]
+        elif (
+            last_start is None
+            or earliest is None
+            or (rows[0]["start"] < earliest and self._prefix_sum == 0)
+        ):
+            # First import, or a fetch window that widened past every hour we
+            # hold: nothing precedes the batch, so the batch may start at 0.
+            # A widening that only reaches behind an accounted prefix is NOT
+            # reset — restarting from 0 would emit sums below the rows the
+            # dashboard already holds (negative bars). It falls through to the
+            # ordinary path, which keeps the prefix and touches stored or new
+            # hours only.
+            new_prefix = 0.0
+            new_buckets = {row["start"]: row[value_key] for row in rows}
+            earliest = rows[0]["start"]
+            starts = [row["start"] for row in rows]
+        else:
+            # Hours in front of the map already scrolled off the payload and
+            # live in the prefix. A later poll can deliver one of them again (a
+            # failed fetch chunk): it is already counted, so it must neither be
+            # imported again nor be put back into the map, which would leave the
+            # prefix counted twice from then on.
+            rows = [
+                row
+                for row in rows
+                if row["start"] in self._buckets or row["start"] > last_start
+            ]
+            if not rows:
+                return
+            new_buckets = dict(self._buckets)
+            new_prefix = self._prefix_sum
+            for start in [item for item in new_buckets if item < rows[0]["start"]]:
+                new_prefix += new_buckets.pop(start)
+            revised = False
+            changed: list[datetime] = []
+            for row in rows:
+                start = row["start"]
+                value = row[value_key]
+                previous = new_buckets.get(start)
+                if previous is None or abs(previous - value) > 1e-6:
+                    if previous is not None:
+                        revised = True
+                    changed.append(start)
+                    new_buckets[start] = value
+            if not changed:
+                return
+            # A revised in-window hour moves the sums of every hour after it, so
+            # the whole window is rewritten; pure additions only need the new
+            # hours, whose sums the walk derives on its own.
+            starts = sorted(new_buckets) if revised else sorted(changed)
+        points = self._points_for(new_buckets, starts, new_prefix)
+        if not points:
+            return
+        async_add_external_statistics(self._hass, self._metadata(), points)
+        self._buckets = new_buckets
+        self._prefix_sum = new_prefix
+        self._earliest_start = earliest
+        self._last_start = max(new_buckets)
+        self._cumulative = new_prefix + sum(new_buckets.values())
+        await self._async_persist()
         _LOGGER.debug("Imported %d statistics points", len(points))

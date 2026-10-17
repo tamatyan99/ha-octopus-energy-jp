@@ -344,6 +344,19 @@ def test_compute_billing_with_surcharges() -> None:
     assert billing["total"] == 900 + 40 * 31 + 60 + 90
 
 
+def test_compute_billing_tiers_reset_each_calendar_month() -> None:
+    daily = {"2026-07-20": 100.0, "2026-08-10": 100.0}
+    rates = [(0.0, 120.0, 30.0), (120.0, None, 40.0)]
+    billing = utils.compute_billing(
+        daily, rates, "2026-07-20", "2026-08-19", "bill", 0.0, 0.0, 0.0
+    )
+    assert billing is not None
+    assert billing["kwh"] == 200.0
+    # 各月 100 kWh は第1段階のまま。期間合計 200 kWh だと 6800 円になる。
+    assert billing["energy_cost"] == 6000
+    assert billing["total"] == 6000
+
+
 def test_compute_billing_no_overlap_returns_none() -> None:
     daily = {"2026-08-01": 5.0}
     rates = [(0.0, None, 30.0)]

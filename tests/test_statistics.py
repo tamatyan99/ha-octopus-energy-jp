@@ -524,11 +524,11 @@ async def test_async_import_skips_invalid_and_unsettled(
             await importer.async_import(hourly)
     assert mock_add.call_count == 1
     points = mock_add.call_args[0][2]
-    # settled_one (0.5, then duplicate-hour 0.25 sorts adjacent), settled_two.
-    assert len(points) == 3
-    assert points[0]["sum"] == pytest.approx(0.5)
-    assert points[1]["sum"] == pytest.approx(0.75)
-    assert points[2]["sum"] == pytest.approx(1.35)
+    # Duplicate settled_one keeps 0.25 (the later value), then settled_two.
+    # Same hour twice: the later value wins, so the hour is imported once.
+    assert len(points) == 2
+    assert points[0]["sum"] == pytest.approx(0.25)
+    assert points[1]["sum"] == pytest.approx(0.85)
     assert all(
         point["start"] <= dt_util.as_utc(now - STATS_IMPORT_BUFFER) for point in points
     )
@@ -707,6 +707,54 @@ async def test_async_import_window_advance_no_false_revision_reimport(
     assert importer._cumulative == pytest.approx(96.0)
 
 
+async def test_async_import_revises_in_window_hour_keeps_prefix(
+    hass: HomeAssistant,
+) -> None:
+    """A cost change after the window scrolls must not restart the sum at 0."""
+    importer = _new_cost_importer(hass, "import-revise-prefix")
+    base1 = _sep_jst(1, 0)
+    hourly1 = [
+        {"start": base1 + timedelta(hours=i), "kwh": 1.0, "cost": 10.0}
+        for i in range(72)
+    ]
+    base2 = _sep_jst(2, 0)
+    hourly2 = [
+        {"start": base2 + timedelta(hours=i), "kwh": 1.0, "cost": 10.0}
+        for i in range(72)
+    ]
+    revised = [dict(item) for item in hourly2]
+    revised[1]["cost"] = 50.0
+    with (
+        _frozen_september_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly1)
+        await importer.async_import(hourly2)
+        assert importer._cumulative == pytest.approx(960.0)
+        assert importer._prefix_sum == pytest.approx(240.0)
+        mock_add.reset_mock()
+        await importer.async_import(revised)
+        assert mock_add.call_count == 1
+        points = mock_add.call_args[0][2]
+        assert points[0]["start"] == dt_util.as_utc(base2)
+        assert points[0]["sum"] == pytest.approx(250.0)
+        assert points[1]["start"] == dt_util.as_utc(base2 + timedelta(hours=1))
+        assert points[1]["state"] == pytest.approx(50.0)
+        assert points[1]["sum"] == pytest.approx(300.0)
+        assert points[-1]["sum"] == pytest.approx(1000.0)
+        assert importer._cumulative == pytest.approx(1000.0)
+        assert importer._prefix_sum == pytest.approx(240.0)
+
+        reloaded = _new_cost_importer(hass, "import-revise-prefix")
+        await reloaded.async_load()
+        assert reloaded._cumulative == pytest.approx(1000.0)
+        assert reloaded._prefix_sum == pytest.approx(240.0)
+        assert reloaded._buckets is not None
+        assert reloaded._buckets[base2 + timedelta(hours=1)] == pytest.approx(50.0)
+
+
 async def test_recovered_baseline_end_to_end_continues_cumulative(
     hass: HomeAssistant,
 ) -> None:
@@ -874,3 +922,325 @@ async def test_cost_async_import_skips_missing_and_invalid_cost(
     assert len(points) == 1
     assert points[0]["state"] == pytest.approx(10.0)
     assert points[0]["sum"] == pytest.approx(10.0)
+
+
+# ---------------------------------------------------------------------------
+# Multi-poll window advance, chunk failure and recovery (September 2026)
+# ---------------------------------------------------------------------------
+
+
+def _sep_hour(index: int) -> datetime:
+    """Hour #1 of the series is 2026-09-01 00:00 JST."""
+    return _sep_jst(1) + timedelta(hours=index - 1)
+
+
+def _sep_range(
+    first: int, last: int, overrides: dict[int, float] | None = None
+) -> list[dict[str, Any]]:
+    """Hourly payload over hour indices, 1.0 kWh per hour unless overridden."""
+    values = overrides or {}
+    return [
+        {"start": _sep_hour(index), "kwh": values.get(index, 1.0)}
+        for index in range(first, last + 1)
+    ]
+
+
+@contextmanager
+def _frozen_at(instant: str) -> Iterator[datetime]:
+    """Freeze the clock at a UTC instant and run HA under Asia/Tokyo."""
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    try:
+        with freeze_time(instant):
+            yield dt_util.now()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+
+def _legacy_payload(last: int, earliest: int, cumulative: float) -> dict[str, Any]:
+    """A main/v0.4.1-shaped statistics store (no hour map)."""
+    return {
+        "last_start": _sep_hour(last).isoformat(),
+        "earliest_start": _sep_hour(earliest).isoformat(),
+        "cumulative": cumulative,
+    }
+
+
+async def test_async_import_redelivered_popped_hour_not_counted_twice(
+    hass: HomeAssistant,
+) -> None:
+    """Regression: a recovered fetch chunk re-delivered an hour already popped.
+
+    C1 imports Sep1..Sep9 23:00. C2 moves the fetch front to Sep8 11:00 and
+    persists. C3 loses its leading chunk, so the front jumps to Sep9 11:00 and
+    24 hours scroll into the prefix. C4 brings Sep8 11:00 back: those 24 hours
+    are already counted, and re-importing them left a permanent +24 kWh offset
+    (+25 instead of +1 for the dashboard delta).
+    """
+    importer = _new_importer(hass, "import-chunk-recovery")
+    with patch(
+        "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+    ) as mock_add:
+        with _frozen_at("2026-09-09 23:30:00"):
+            await importer.async_import(_sep_range(1, 216))
+        pts1 = mock_add.call_args[0][2]
+        assert len(pts1) == 216
+        assert pts1[-1]["sum"] == pytest.approx(216.0)
+        mock_add.reset_mock()
+
+        with _frozen_at("2026-09-10 09:30:00"):
+            await importer.async_import(_sep_range(180, 226))
+        pts2 = mock_add.call_args[0][2]
+        assert len(pts2) == 10
+        assert pts2[0]["start"] == dt_util.as_utc(_sep_hour(217))
+        assert pts2[-1]["sum"] == pytest.approx(226.0)
+        assert importer._prefix_sum == pytest.approx(179.0)
+        mock_add.reset_mock()
+
+        with _frozen_at("2026-09-10 10:30:00"):
+            await importer.async_import(_sep_range(204, 227))
+        pts3 = mock_add.call_args[0][2]
+        assert len(pts3) == 1
+        assert pts3[0]["sum"] == pytest.approx(227.0)
+        assert importer._prefix_sum == pytest.approx(203.0)
+        mock_add.reset_mock()
+
+        with _frozen_at("2026-09-10 14:30:00"):
+            await importer.async_import(_sep_range(180, 231))
+    points = mock_add.call_args[0][2]
+    # Only the 4 hours past the cursor are new: the 24 re-delivered hours live
+    # in the prefix and must not be imported a second time.
+    assert len(points) == 4
+    assert [point["start"] for point in points] == [
+        dt_util.as_utc(_sep_hour(index)) for index in (228, 229, 230, 231)
+    ]
+    assert [point["sum"] for point in points] == pytest.approx(
+        [228.0, 229.0, 230.0, 231.0]
+    )
+    assert points[0]["sum"] - pts3[0]["sum"] == pytest.approx(1.0)
+    assert importer._cumulative == pytest.approx(231.0)
+    assert importer._prefix_sum == pytest.approx(203.0)
+
+
+async def test_async_load_legacy_store_upgrades_and_revises_overlap_hour(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A v0.4.1 store (no hour map) must upgrade instead of staying inert.
+
+    The legacy payload only carries cumulative = the total of every hour up to
+    last_start. After the upgrade the next import rebuilds the window on that
+    anchor: already imported hours keep their absolute sums, the revised overlap
+    hour is re-emitted, and the newer hours continue the same total.
+    """
+    importer = _new_importer(hass, "load-legacy-upgrade")
+    await importer._store.async_save(_legacy_payload(216, 1, 216.0))
+    with _frozen_at("2026-09-10 09:30:00"), caplog.at_level(logging.INFO):
+        await importer.async_load()
+    assert importer._buckets == {}
+    assert importer._prefix_sum == pytest.approx(216.0)
+    assert importer._cumulative == pytest.approx(216.0)
+    assert importer._last_start == _sep_hour(216)
+    assert any("no hour map" in record.getMessage() for record in caplog.records)
+
+    with (
+        _frozen_at("2026-09-10 14:30:00"),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(_sep_range(73, 220, {100: 5.0}))
+    points = mock_add.call_args[0][2]
+    sums = {point["start"]: point["sum"] for point in points}
+    # The hour that closed the legacy range keeps the stored cumulative and the
+    # hours after it continue from there: no restart at 0, no double import.
+    assert sums[dt_util.as_utc(_sep_hour(216))] == pytest.approx(216.0)
+    assert sums[dt_util.as_utc(_sep_hour(217))] == pytest.approx(217.0)
+    assert sums[dt_util.as_utc(_sep_hour(220))] == pytest.approx(220.0)
+    # The revised overlap hour is re-emitted; on the anchor its revision moves
+    # the hours in front of it (95.0 at hour 99) and not the stored total.
+    assert sums[dt_util.as_utc(_sep_hour(99))] == pytest.approx(95.0)
+    assert sums[dt_util.as_utc(_sep_hour(100))] == pytest.approx(100.0)
+    assert importer._buckets is not None
+    assert importer._buckets[_sep_hour(100)] == pytest.approx(5.0)
+    assert importer._prefix_sum == pytest.approx(68.0)
+    assert importer._cumulative == pytest.approx(220.0)
+
+    # The new shape is persisted, so the bucketed path stays on from now on.
+    stored = await importer._store.async_load()
+    assert stored is not None
+    assert stored["prefix_sum"] == pytest.approx(68.0)
+    assert len(stored["buckets"]) == 148
+    reloaded = _new_importer(hass, "load-legacy-upgrade")
+    await reloaded.async_load()
+    assert reloaded._buckets is not None
+    assert reloaded._prefix_sum == pytest.approx(68.0)
+    assert reloaded._cumulative == pytest.approx(220.0)
+
+
+async def test_async_import_legacy_anchor_waits_for_payload_covering_cursor(
+    hass: HomeAssistant,
+) -> None:
+    """An upgraded store only rebuilds when the payload tiles the stored cursor.
+
+    A failed chunk leaves the payload truncated or holed in front of the cursor,
+    and the legacy cumulative cannot be split across a missing hour: nothing is
+    rewritten and the empty window stays armed for the next complete poll.
+    """
+    importer = _new_importer(hass, "load-legacy-incomplete")
+    await importer._store.async_save(_legacy_payload(216, 1, 216.0))
+    with _frozen_at("2026-09-10 09:30:00"):
+        await importer.async_load()
+    with (
+        _frozen_at("2026-09-10 15:30:00"),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        # Tail stopped before the cursor.
+        await importer.async_import(_sep_range(100, 215))
+        assert mock_add.call_count == 0
+        # Hole in front of the cursor (hour 201 missing).
+        await importer.async_import(_sep_range(100, 200) + _sep_range(202, 232))
+        assert mock_add.call_count == 0
+        assert importer._buckets == {}
+        await importer.async_import(_sep_range(100, 232))
+    assert mock_add.call_count == 1
+    points = mock_add.call_args[0][2]
+    assert len(points) == 133
+    sums = {point["start"]: point["sum"] for point in points}
+    assert sums[dt_util.as_utc(_sep_hour(216))] == pytest.approx(216.0)
+    assert sums[dt_util.as_utc(_sep_hour(232))] == pytest.approx(232.0)
+    assert importer._buckets is not None
+    assert importer._prefix_sum == pytest.approx(99.0)
+    assert importer._cumulative == pytest.approx(232.0)
+
+
+async def test_async_import_legacy_anchor_appends_when_payload_after_cursor(
+    hass: HomeAssistant,
+) -> None:
+    """A legacy store older than the fetch window appends on its cumulative.
+
+    The hours between the cursor and the payload were never delivered by the
+    API, so they are not part of the stored cumulative and have no row: the new
+    hours simply continue from it.
+    """
+    importer = _new_importer(hass, "load-legacy-tail")
+    await importer._store.async_save(_legacy_payload(216, 1, 216.0))
+    with _frozen_at("2026-09-10 09:30:00"):
+        await importer.async_load()
+    with (
+        _frozen_at("2026-09-10 17:30:00"),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        # Reaching behind the earliest accounted hour cannot be anchored either.
+        await importer.async_import(_sep_range(0, 218))
+        assert mock_add.call_count == 0
+        assert importer._buckets == {}
+        await importer.async_import(_sep_range(217, 218))
+    points = mock_add.call_args[0][2]
+    assert [point["sum"] for point in points] == pytest.approx([217.0, 218.0])
+    assert importer._buckets == {_sep_hour(217): 1.0, _sep_hour(218): 1.0}
+    assert importer._prefix_sum == pytest.approx(216.0)
+    assert importer._cumulative == pytest.approx(218.0)
+
+
+async def test_async_import_front_moving_earlier_keeps_prefix_no_reset(
+    hass: HomeAssistant,
+) -> None:
+    """A batch front in front of the earliest accounted hour must not reset.
+
+    The stored state holds 50 prefix hours and cumulative 100.0. A payload that
+    reaches back before the earliest accounted hour cannot be placed on a 0
+    base: rewriting from 0 would emit sums below the rows the dashboard holds.
+    """
+    importer = _new_importer(hass, "import-front-earlier")
+    await importer._store.async_save(
+        {
+            "last_start": _sep_hour(100).isoformat(),
+            "earliest_start": _sep_hour(51).isoformat(),
+            "cumulative": 100.0,
+            "prefix_sum": 50.0,
+            "buckets": [
+                {"start": _sep_hour(index).isoformat(), "value": 1.0}
+                for index in range(51, 101)
+            ],
+        }
+    )
+    await importer.async_load()
+    assert importer._prefix_sum == pytest.approx(50.0)
+    assert importer._last_start == _sep_hour(100)
+
+    with (
+        _frozen_at("2026-09-10 14:30:00"),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(_sep_range(20, 110))
+    points = mock_add.call_args[0][2]
+    # Only the hours past the cursor are new: the hours that reach behind the
+    # earliest accounted hour are dropped rather than restarting the series.
+    assert [point["sum"] for point in points] == pytest.approx(
+        [float(index) for index in range(101, 111)]
+    )
+    assert all(point["sum"] >= 100.0 for point in points)
+    assert importer._prefix_sum == pytest.approx(50.0)
+    assert importer._earliest_start == _sep_hour(51)
+    assert importer._cumulative == pytest.approx(110.0)
+
+
+@pytest.mark.parametrize(
+    ("entry_id", "override"),
+    [
+        ("map-not-list", {"prefix_sum": 0.0, "buckets": "nope"}),
+        ("map-entry-not-dict", {"prefix_sum": 0.0, "buckets": ["nope"]}),
+        (
+            "map-start-junk",
+            {"prefix_sum": 0.0, "buckets": [{"start": "junk", "value": 1.0}]},
+        ),
+        (
+            "map-value-junk",
+            {
+                "prefix_sum": 0.0,
+                "buckets": [{"start": _sep_hour(1).isoformat(), "value": "junk"}],
+            },
+        ),
+        (
+            "map-value-inf",
+            {
+                "prefix_sum": 0.0,
+                "buckets": [{"start": _sep_hour(1).isoformat(), "value": float("inf")}],
+            },
+        ),
+        (
+            "map-mismatch",
+            {
+                "prefix_sum": 5.0,
+                "buckets": [{"start": _sep_hour(1).isoformat(), "value": 1.0}],
+            },
+        ),
+    ],
+)
+async def test_async_load_unusable_hour_map_warns_and_falls_back(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    entry_id: str,
+    override: dict[str, Any],
+) -> None:
+    """An unusable hour map must name the failed part, not fail silently."""
+    importer = _new_importer(hass, entry_id)
+    data = _legacy_payload(3, 1, 3.0)
+    data.update(override)
+    await importer._store.async_save(data)
+    with caplog.at_level(logging.WARNING):
+        await importer.async_load()
+    assert importer._buckets is None
+    assert importer._prefix_sum == 0.0
+    assert any(
+        "Ignoring statistics hour map" in record.getMessage()
+        for record in caplog.records
+    )

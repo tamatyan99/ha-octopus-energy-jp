@@ -211,45 +211,40 @@ query tariff($gridOperatorCode: String!, $productCode: String) {
 # 契約(agreement)の商品から基本料金・燃料費調整額・再エネ賦課金を取得する。
 # product は union 型 (段階制 / 単一単価 / FIT / ガス) で、料金項目を持つのは
 # ProductInterface を実装する ElectricitySingleStepProduct /
-# ElectricitySteppedProduct だけ。FIT とガスには料金項目がない (code のみ)。
-# フィールド名は OEJP Kraken スキーマに厳密に従うこと。誤った名前は
+# ElectricitySteppedProduct だけ。FIT とガスには料金項目がないため、
+# 名前 (displayName) のみを取得して料金は欠損として扱う。
+# フィールド名は OEJP Kraken スキーマに一致させること。誤った名前は
 # "Cannot query field" で実行時に落ちるため、mock のテストだけでは気付けない
 # (test_surcharges_query_uses_real_schema_field_names が名前を固定し、
 #  test_get_surcharges_field_error_raises_api_error が検出を保証する)。
 SURCHARGE_FIELDS = """
-              fuelCostAdjustment {
-                validFrom validTo pricePerUnit pricePerUnitIncTax unitType
-              }
-              renewableEnergyLevy {
-                validFrom validTo pricePerUnit pricePerUnitIncTax unitType
-              }
-              standingChargePricePerDay
-              standingChargeUnitType
-              standingCharges { pricePerUnitIncTax validFrom validTo }"""
+  standingChargePricePerDay
+  fuelCostAdjustment { pricePerUnitIncTax validFrom validTo }
+  renewableEnergyLevy { pricePerUnitIncTax validFrom validTo }
+"""
 
 # 契約は account → properties → electricitySupplyPoints → agreements の下にあり、
-# ルートに surcharges というフィールドは存在しない (operation 名だけ Surcharges)。
+# ルートに surcharges というフィールドは存在しない (operation 名だけ surcharges)。
+# 有効期間の選択はサーバ引数に頼らず _pick_active でローカルに行う。
 SURCHARGES_QUERY = (
     """
-query Surcharges($accountNumber: String!) {
+query surcharges($accountNumber: String!) {
   account(accountNumber: $accountNumber) {
     properties {
       electricitySupplyPoints {
-        agreements(onlyActive: true) {
+        agreements {
           validFrom
           validTo
           product {
             __typename
-            ... on ElectricitySingleStepProduct {"""
-    + SURCHARGE_FIELDS
-    + """
-            }
             ... on ElectricitySteppedProduct {"""
     + SURCHARGE_FIELDS
-    + """
-            }
-            ... on ElectricityFitProduct { code displayName }
-            ... on GasTieredProduct { code }
+    + """}
+            ... on ElectricitySingleStepProduct {"""
+    + SURCHARGE_FIELDS
+    + """}
+            ... on ElectricityFitProduct { displayName }
+            ... on GasTieredProduct { displayName }
           }
         }
       }
@@ -701,10 +696,8 @@ class OctopusEnergyJpApiClient:
         returning a silent 0.0, so the caller keeps its previous values.
 
         ``standing_charge_per_day`` is taken verbatim from
-        ``standingChargePricePerDay`` (already a per-day amount). The raw
-        ``standingCharges`` rows are per ampere per day and are never used to
-        derive it: without knowing the amperage that would silently corrupt
-        the daily basic charge.
+        ``standingChargePricePerDay``, which is already a per-day amount: no
+        amperage or unit conversion is applied anywhere.
         """
         data = await self._async_query(
             SURCHARGES_QUERY, {"accountNumber": account_number}
@@ -721,30 +714,25 @@ class OctopusEnergyJpApiClient:
         standing = _coerce_price(
             product.get("standingChargePricePerDay"), "standingChargePricePerDay"
         )
-        unit_type = product.get("standingChargeUnitType")
-        if standing is None and product.get("standingCharges"):
-            _LOGGER.debug(
-                "standingChargePricePerDay is missing while standingCharges rows "
-                "are present (standingChargeUnitType=%s); per-ampere rows are not "
-                "converted into a per-day charge",
-                unit_type,
-            )
-        elif standing is not None and unit_type not in (None, "DAYS_ON_SUPPLY"):
-            _LOGGER.debug(
-                "standingChargeUnitType=%s while standingChargePricePerDay is used "
-                "as-is",
-                unit_type,
-            )
         fuel = _select_charge_field(
             product.get("fuelCostAdjustment"), now, "fuelCostAdjustment"
         )
         levy = _select_charge_field(
             product.get("renewableEnergyLevy"), now, "renewableEnergyLevy"
         )
+        fuel_price = _price_of(fuel, "fuelCostAdjustment")
+        levy_price = _price_of(levy, "renewableEnergyLevy")
+        if standing is None and fuel_price is None and levy_price is None:
+            # FIT / ガス商品など料金項目を持たない契約 (displayName のみ取得)
+            _LOGGER.debug(
+                "No charge fields for product %s (%s)",
+                product.get("displayName"),
+                product.get("__typename"),
+            )
         return {
             "standing_charge_per_day": standing,
-            "fuel_per_kwh": _price_of(fuel, "fuelCostAdjustment"),
-            "levy_per_kwh": _price_of(levy, "renewableEnergyLevy"),
+            "fuel_per_kwh": fuel_price,
+            "levy_per_kwh": levy_price,
         }
 
     async def async_get_tariff_rates(

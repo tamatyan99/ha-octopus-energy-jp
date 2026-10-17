@@ -756,41 +756,47 @@ API_LOGGER = "custom_components.octopus_energy_jp.api"
 
 
 def test_surcharges_query_uses_real_schema_field_names() -> None:
-    """The document must match the OEJP schema.
+    """The document must match the OEJP schema and stay lean.
 
     A wrong field name only fails against the real API ("Cannot query field"),
     so the shape is pinned here instead of relying on mocked responses.
     """
-    assert "query Surcharges($accountNumber: String!)" in SURCHARGES_QUERY
-    # The agreement path only exists under the account; there is no root
-    # ``surcharges`` query field.
-    assert "surcharges(" not in SURCHARGES_QUERY.replace("Surcharges(", "")
-    assert "agreements(onlyActive: true)" in SURCHARGES_QUERY
+    assert "query surcharges($accountNumber: String!)" in SURCHARGES_QUERY
+    # There is no root-level ``surcharges`` field: the agreement data lives
+    # under the account tree.
+    assert "\n  surcharges" not in SURCHARGES_QUERY
     for name in (
+        "account(accountNumber: $accountNumber)",
+        "properties {",
+        "electricitySupplyPoints {",
+        "agreements {",
+        "validFrom",
+        "validTo",
+        "product {",
         "__typename",
         "... on ElectricitySingleStepProduct",
         "... on ElectricitySteppedProduct",
-        "... on ElectricityFitProduct",
-        "... on GasTieredProduct",
+        "... on ElectricityFitProduct { displayName }",
+        "... on GasTieredProduct { displayName }",
         "standingChargePricePerDay",
-        "standingChargeUnitType",
-        "standingCharges {",
-        "pricePerUnitIncTax",
-        "unitType",
+        "fuelCostAdjustment { pricePerUnitIncTax validFrom validTo }",
+        "renewableEnergyLevy { pricePerUnitIncTax validFrom validTo }",
     ):
         assert name in SURCHARGES_QUERY
     # Both charge-bearing fragments request the same real field names.
     assert SURCHARGES_QUERY.count("fuelCostAdjustment {") == 2
     assert SURCHARGES_QUERY.count("renewableEnergyLevy {") == 2
-    for wrong in (
+    for absent in (
+        "onlyActive",  # agreement selection stays local (_pick_active)
         "fuelAdjustment",
         "renewableLevy",
         "basicCharge",
         "fuelGrossCost",
-        "gridOperatorCode",
-        "regionOfOperation",
+        "standingCharges",  # per-ampere rows are never requested or scaled
+        "standingChargeUnitType",
+        "unitType",
     ):
-        assert wrong not in SURCHARGES_QUERY
+        assert absent not in SURCHARGES_QUERY
 
 
 async def test_get_surcharges_field_error_raises_api_error() -> None:
@@ -843,10 +849,6 @@ def _stepped_product(
     return {
         "__typename": typename,
         "standingChargePricePerDay": standing,
-        "standingChargeUnitType": "DAYS_ON_SUPPLY",
-        "standingCharges": [
-            {"pricePerUnitIncTax": "9.85", "validFrom": "2026-01-01", "validTo": None}
-        ],
         "fuelCostAdjustment": fuel,
         "renewableEnergyLevy": levy,
     }
@@ -899,22 +901,37 @@ async def test_get_surcharges_picks_active_agreement_and_rates(
     }
 
 
-@pytest.mark.parametrize("typename", ["ElectricityFitProduct", "GasTieredProduct"])
-async def test_get_surcharges_missing_fields_are_none(typename: str) -> None:
-    """FIT/Gas products carry no charge fields, so every value is absent."""
+@pytest.mark.parametrize(
+    ("typename", "display_name"),
+    [
+        ("ElectricityFitProduct", "FIT sales"),
+        ("GasTieredProduct", "Gas Flex"),
+    ],
+)
+async def test_get_surcharges_non_electric_product_parses(
+    typename: str, display_name: str, caplog
+) -> None:
+    """FIT/Gas products parse to absent values (no crash, no zeros).
+
+    The name-only fragments let these union members be identified instead of
+    collapsing to an opaque product.
+    """
     agreements = [
         {
             "validFrom": None,
             "validTo": None,
-            "product": {"__typename": typename, "code": "X-1"},
+            "product": {"__typename": typename, "displayName": display_name},
         }
     ]
     client = _client_with_query(_surcharges_payload(agreements))
-    assert await client.async_get_surcharges("A-1", now=NOW) == {
+    with caplog.at_level("DEBUG", logger=API_LOGGER):
+        result = await client.async_get_surcharges("A-1", now=NOW)
+    assert result == {
         "standing_charge_per_day": None,
         "fuel_per_kwh": None,
         "levy_per_kwh": None,
     }
+    assert any(display_name in record.getMessage() for record in caplog.records)
 
 
 async def test_get_surcharges_newer_agreement_supersedes_null_product() -> None:
@@ -926,7 +943,6 @@ async def test_get_surcharges_newer_agreement_supersedes_null_product() -> None:
             "validTo": None,
             "product": {
                 "__typename": "ElectricityFitProduct",
-                "code": "FIT-X",
                 "displayName": "FIT product",
             },
         },
@@ -1019,12 +1035,14 @@ async def test_get_surcharges_absent_charge_fields_stay_none() -> None:
 
 
 async def test_get_surcharges_uses_per_day_standing_charge_verbatim() -> None:
-    """standingChargePricePerDay (JPY/day) wins over the per-ampere rows."""
+    """standingChargePricePerDay (JPY/day) is used as-is; no amperage math."""
     product = _stepped_product(
         {"pricePerUnitIncTax": "1.0"},
         {"pricePerUnitIncTax": "4.18"},
         standing="295.24",
     )
+    # Raw per-ampere rows never reach the parser via the query, but if a
+    # response carries them they must not be converted into a daily charge.
     product["standingChargeUnitType"] = "DAYS_ON_SUPPLY"
     product["standingCharges"] = [
         {"pricePerUnitIncTax": "9.85", "validFrom": "2026-01-01", "validTo": None},
@@ -1033,7 +1051,6 @@ async def test_get_surcharges_uses_per_day_standing_charge_verbatim() -> None:
     client = _client_with_query(_surcharges_payload([{"product": product}]))
     result = await client.async_get_surcharges("A-1", now=NOW)
     assert result["standing_charge_per_day"] == 295.24
-    # No unit conversion happens: not per-ampere rows, not scaled by amperage.
     assert result["standing_charge_per_day"] != 9.85
 
 
